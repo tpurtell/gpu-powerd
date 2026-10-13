@@ -2,8 +2,8 @@
 class GpuPowerd < Formula
   desc "Thermal- and budget-aware NVIDIA power-limit daemon"
   homepage "https://github.com/tpurtell/gpu-powerd"
-  url "https://github.com/tpurtell/gpu-powerd/archive/refs/tags/v0.1.2.tar.gz"
-  sha256 "aef8499e271f561fc6edb14975e4908978274d9765fef608d0f716dda9ea9c67"
+  url "https://github.com/tpurtell/gpu-powerd/archive/refs/tags/v0.1.3.tar.gz"
+  sha256 "5f71adff9a34baf4eb9c55890f3b5707077bc9efd1f1754a1467dee1d11682ad"
   license any_of: ["Apache-2.0", "MIT"]
 
   depends_on "patchelf" => :build
