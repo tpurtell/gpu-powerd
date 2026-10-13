@@ -637,8 +637,12 @@ fn set(args: &Args) -> Result<()> {
 /// The running daemon's pid: the lock is held, and the pid recorded in it is a
 /// `gpu-powerd` process running the daemon (not `--restore`, `--check` or a stale pid).
 fn running_daemon() -> Option<i32> {
-    if let Ok(free) = lock(None, false) {
-        drop(free);
+    // Probe without creating the file: an unprivileged `status`/`set` must never make the lock.
+    let file = File::open(LOCK_FILE).ok()?;
+    // SAFETY: a valid open file descriptor; flock has no memory effects.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } == 0 {
+        // SAFETY: as above; release the probe's shared lock at once.
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
         return None;
     }
     let pid: i32 = std::fs::read_to_string(LOCK_FILE).ok()?.trim().parse().ok()?;

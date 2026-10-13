@@ -32,7 +32,6 @@ StateDirectoryMode=0755
 # through NVML under the same restrictions, plus the writable state paths.
 NoNewPrivileges=yes
 ProtectSystem=strict
-ReadWritePaths=/run/lock
 ProtectHome=yes
 PrivateTmp=yes
 ProtectHostname=yes

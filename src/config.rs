@@ -16,7 +16,10 @@ pub const DEFAULT_CONFIG: &str = "/etc/gpu-powerd/config.toml";
 pub const DEFAULT_STATE_FILE: &str = "/run/gpu-powerd/state.json";
 pub const DEFAULT_MODEL_FILE: &str = "/var/lib/gpu-powerd/model.json";
 pub const DEFAULT_STREAM_SOCKET: &str = "/run/gpu-powerd/stream.sock";
-pub const LOCK_FILE: &str = "/run/lock/gpu-powerd.lock";
+/// In the daemon's own root-owned runtime directory (systemd RuntimeDirectory, 0755): an
+/// unprivileged process can never create it, unlike a file in sticky world-writable /run/lock,
+/// where a user-owned lock would lock root out (fs.protected_regular).
+pub const LOCK_FILE: &str = "/run/gpu-powerd/daemon.lock";
 
 /// Keys that may differ per card. `None` inherits: the top level, then the default.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
