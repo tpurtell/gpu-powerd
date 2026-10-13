@@ -1,0 +1,20 @@
+# gpu-powerd first-run config for raptor (2x RTX PRO 6000, 150..600 W boards).
+# Install as /etc/gpu-powerd/config.toml before the first `gpu-powerd-setup`.
+#
+# It changes nothing about today's behaviour: both cards are capped at 325 W, the
+# value set by hand since September, and fall back to 325 W on any exit. At 325 W the
+# cards measured at most 69 C, below throttle_start_c, so the ramp never acts. Budget
+# splitting only moves an idle card between 150 and 325 W. The model learns and is
+# logged (`gpu-powerd model`); once it is confident it can only lower a limit.
+# Raise the ceiling later, e.g.:
+#   sudo /usr/local/sbin/gpu-powerd set max_w=450 system_budget_w=900
+fallback_w = 325
+base_w = 150
+max_w = 325
+system_budget_w = 650
+
+throttle_start_c = 75
+hard_c = 85
+
+learn = true
+use_model = true

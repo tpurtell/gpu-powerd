@@ -8,8 +8,9 @@
 //!
 //! Budget: every GPU first gets `base_w`; the rest is water-filled (equal levels,
 //! max-min fair) up to each GPU's demand, then any spare up to each GPU's thermal
-//! cap (an idle GPU holds base plus whatever the busy ones do not want, so it can
-//! start work without waiting; the shares rebalance once it draws). Demand comes from load: an idle GPU wants base, a power-limited GPU
+//! cap. With `idle_takes_spare` (the default) an idle GPU holds base plus a share of
+//! whatever the busy ones do not want, so it can start work without waiting; the
+//! shares rebalance once it draws. Without it an idle GPU stays at base. Demand comes from load: an idle GPU wants base, a power-limited GPU
 //! (drawing at least `pinned_fraction` of its enforced limit, or reporting a power
 //! cap clock event while busy) wants its thermal cap, and any other busy GPU wants
 //! its draw plus `demand_headroom_w`. Demand never exceeds the thermal cap, so a
@@ -242,7 +243,15 @@ impl Controller {
         }
         let ok: Vec<bool> = checked.iter().map(Result::is_ok).collect();
         let ceilings_demand: Vec<f64> = (0..n).map(|i| if ok[i] { demand[i] } else { bases[i] }).collect();
-        let ceilings_cap: Vec<f64> = (0..n).map(|i| if ok[i] { caps[i] } else { bases[i] }).collect();
+        // Spare budget goes up to each thermal cap; an idle GPU takes a share of it only
+        // with idle_takes_spare (otherwise it stays at its demand, base).
+        let ceilings_cap: Vec<f64> = (0..n)
+            .map(|i| match ok[i] {
+                true if idle[i] && !c.idle_takes_spare => demand[i],
+                true => caps[i],
+                false => bases[i],
+            })
+            .collect();
         let first = water_fill(&bases, &ceilings_demand, settings.budget_w);
         let fill = water_fill(&first, &ceilings_cap, settings.budget_w);
 

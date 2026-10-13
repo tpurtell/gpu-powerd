@@ -54,6 +54,8 @@ pub struct Config {
     pub idle_util_pct: f64,
     /// A busy GPU that is not power-limited wants its smoothed draw plus this much.
     pub demand_headroom_w: f64,
+    /// An idle GPU also takes a share of budget the busy GPUs do not want (false: base only).
+    pub idle_takes_spare: bool,
 
     /// Fit the thermal model online.
     pub learn: bool,
@@ -95,6 +97,7 @@ impl Default for Config {
             pinned_fraction: 0.95,
             idle_util_pct: 5.0,
             demand_headroom_w: 50.0,
+            idle_takes_spare: true,
             learn: true,
             use_model: true,
             model_margin_c: 1.0,
@@ -322,5 +325,17 @@ mod tests {
     fn example_config_parses() {
         let text = include_str!("../config.example.toml");
         Config::parse(text).unwrap().resolve(&devices()).unwrap();
+    }
+
+    #[test]
+    fn raptor_first_run_config_keeps_todays_limits() {
+        let text = include_str!("../deploy/raptor-first-run.toml");
+        let settings = Config::parse(text).unwrap().resolve(&devices()).unwrap();
+        assert_eq!(settings.budget_w, 650.0);
+        for gpu in &settings.gpus {
+            assert_eq!(*gpu, GpuLimits { base_w: 150.0, max_w: 325.0, fallback_w: 325.0 });
+        }
+        let c = &settings.config;
+        assert_eq!((c.throttle_start_c, c.hard_c, c.learn, c.use_model), (75.0, 85.0, true, true));
     }
 }

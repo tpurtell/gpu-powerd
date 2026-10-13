@@ -60,8 +60,12 @@ Every GPU first gets `base_w`. Demand then comes from load:
 
 The budget above the bases is water-filled up to each GPU's demand (max-min fair:
 equal shares, and a GPU that wants less leaves the rest to the others). Whatever is
-left over is filled up to each GPU's thermal cap, so an idle card holds some spare
-power and can start work without waiting. Demand never exceeds a GPU's thermal cap,
+left over is filled up to each GPU's thermal cap. With `idle_takes_spare = true` (the
+default) that includes idle cards: with a 900 W budget and one card busy at 600 W,
+the idle card holds 300 W rather than 150 W, so it can start work at full speed
+without waiting for the budget to move. The total never exceeds the budget either
+way, and the shares rebalance as soon as the idle card draws. Set it to `false` to
+keep idle cards at `base_w`. Demand never exceeds a GPU's thermal cap,
 so when a hot card is capped, the budget it cannot use goes to the cooler card,
 within that card's own thermal limit.
 
@@ -141,6 +145,7 @@ See [`config.example.toml`](config.example.toml). The main keys:
 | `base_w` / `max_w` | board min / max | per-GPU floor and ceiling (top level or `[gpu."SEL"]`) |
 | `fallback_w` | `base_w` | the limit left on exit, crash or failed write |
 | `raise_w_per_s` | 10 | how fast a thermal cap rises again |
+| `idle_takes_spare` | true | an idle GPU also holds budget the busy ones don't want |
 | `use_model` | true | let a confident model lower limits |
 
 GPUs are selected by NVML index (`[gpu.0]`), UUID (`[gpu."GPU-…"]`) or PCI bus id

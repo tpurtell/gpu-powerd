@@ -37,6 +37,8 @@
 #pinned_fraction = 0.95       # draw >= this x limit means power-limited: wants more
 #idle_util_pct = 5            # below this utilization (and not power-limited) a GPU is idle
 #demand_headroom_w = 50       # a busy, unpinned GPU wants its draw plus this
+#idle_takes_spare = true      # an idle GPU also holds budget the busy ones don't want
+                              # (starts work at once; false keeps it at base_w)
 
 # The learned thermal model (first order, self and cross coupling, fitted online).
 # It can only lower a limit: once confident it keeps the predicted steady-state

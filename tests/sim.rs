@@ -97,6 +97,13 @@ fn one_busy_card_gets_its_max_within_the_budget() {
     let gpu1 = &rig.daemon.last.as_ref().unwrap().gpus[1].plan;
     assert!(gpu1.idle && gpu1.demand_w == 150.0, "idle demand is base: {gpu1:?}");
 
+    // Without idle_takes_spare the idle card stays at base.
+    let plant = rig.plant.borrow().clone();
+    rig.daemon.reload(settings("system_budget_w = 900\nlearn = false\nidle_takes_spare = false", &plant));
+    rig.run(5);
+    assert_eq!((rig.limit(0), rig.limit(1)), (600.0, 150.0));
+    assert_eq!(rig.bound(1), Bound::Budget);
+
     // With a tighter budget the idle card has exactly base.
     let plant = rig.plant.borrow().clone();
     rig.daemon.reload(settings("system_budget_w = 750\nlearn = false", &plant));
