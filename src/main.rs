@@ -628,6 +628,24 @@ mod tests {
     use super::edit_config;
 
     #[test]
+    fn sd_notify_reaches_the_socket() {
+        let dir = std::env::temp_dir().join(format!("gpu-powerd-notify-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("notify.sock");
+        let _ = std::fs::remove_file(&path);
+        let socket = std::os::unix::net::UnixDatagram::bind(&path).unwrap();
+        // SAFETY: this is the only test that touches NOTIFY_SOCKET.
+        unsafe { std::env::set_var("NOTIFY_SOCKET", &path) };
+        super::notify("READY=1");
+        let mut buffer = [0u8; 64];
+        let n = socket.recv(&mut buffer).unwrap();
+        assert_eq!(&buffer[..n], b"READY=1");
+        // SAFETY: as above.
+        unsafe { std::env::remove_var("NOTIFY_SOCKET") };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn set_edits_and_validates() {
         let text = "# keep me\nsystem_budget_w = 900\n\n[gpu.0]\nmax_w = 500\n";
         let out =
