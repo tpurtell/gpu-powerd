@@ -1,0 +1,135 @@
+#!/bin/sh
+# Install gpu-powerd from a Homebrew (or other) bundle into root-owned locations.
+#
+#   sudo "$(brew --prefix)/bin/gpu-powerd-setup"               # install, or upgrade after brew upgrade
+#   sudo "$(brew --prefix)/bin/gpu-powerd-setup" --uninstall   # remove; re-enable what it replaced
+#   "$(brew --prefix)/bin/gpu-powerd-setup" --check            # verify the bundle, no root needed
+#
+# Why this step exists: gpu-powerd runs as root, so it must not execute from a prefix
+# your user (and therefore your agents) can write. This copies it to /usr/local/sbin,
+# owned by root, after checking that the binary loads nothing from a writable location
+# (dynamic loader, RPATH/RUNPATH). NVML is opened at runtime from the driver's own
+# libnvidia-ml.so.1 by the system loader's search path.
+#
+# Running it trusts the bundle at that moment, like any command you run with sudo.
+set -eu
+
+self=$(readlink -f "$0")
+tarball="$(dirname "$self")/../libexec/gpu-powerd/root-bundle.tar"
+python=/usr/bin/python3
+[ -x "$python" ] || { echo "gpu-powerd-setup: $python is required to verify the binary" >&2; exit 1; }
+
+# Unpack into a private directory. Homebrew rewrites the ELF loader of every binary it
+# pours, so the root binary travels as a tarball that it leaves untouched.
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+chmod 700 "$work"
+if [ -f "$tarball" ]; then
+    tar -xf "$tarball" -C "$work" --no-same-owner
+    bundle=$work
+else
+    bundle=$(dirname "$self")   # a plain bundle directory (deploy/ next to a built binary)
+fi
+for f in gpu-powerd gpu-powerd.service config.example.toml install.sh; do
+    [ -f "$bundle/$f" ] || { echo "gpu-powerd-setup: missing $f in the bundle" >&2; exit 1; }
+done
+
+verify() {
+    # Refuse a binary that could load code from a location a non-root user can change,
+    # or that needs a newer glibc than the Ubuntu 24.04 baseline.
+    "$python" - "$bundle/gpu-powerd" <<'PY'
+import os, re, stat, struct, sys
+
+def writable_by_others(path):
+    """True if a non-root user could modify path or any directory above it."""
+    path = os.path.realpath(path)
+    while True:
+        st = os.stat(path)
+        if st.st_uid != 0 or st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            return True
+        if path == "/":
+            return False
+        path = os.path.dirname(path)
+
+def check(binary):
+    data = open(binary, "rb").read()
+    if data[:4] != b"\x7fELF" or data[4] != 2 or data[5] != 1:
+        sys.exit(f"{binary}: not a 64-bit little-endian ELF file")
+    phoff, = struct.unpack_from("<Q", data, 0x20)
+    phentsize, phnum = struct.unpack_from("<HH", data, 0x36)
+    interp, dynamic, loads = None, None, []
+    for i in range(phnum):
+        off = phoff + i * phentsize
+        ptype, = struct.unpack_from("<I", data, off)
+        p_offset, p_vaddr = struct.unpack_from("<QQ", data, off + 8)
+        p_filesz, = struct.unpack_from("<Q", data, off + 32)
+        if ptype == 3:  # PT_INTERP
+            interp = data[p_offset:p_offset + p_filesz].rstrip(b"\0").decode()
+        elif ptype == 2:  # PT_DYNAMIC
+            dynamic = (p_offset, p_filesz)
+        elif ptype == 1:  # PT_LOAD
+            loads.append((p_vaddr, p_offset, p_filesz))
+    if interp is None:
+        sys.exit(f"{binary}: no ELF interpreter")
+    if not (interp.startswith("/lib") or interp.startswith("/usr/lib")) or writable_by_others(interp):
+        sys.exit(f"{binary}: refuses to install: loader {interp} is not a root-owned system path")
+    strtab, runpaths = None, []
+    if dynamic:
+        off, size = dynamic
+        entries = [struct.unpack_from("<qQ", data, off + j) for j in range(0, size, 16)]
+        for tag, val in entries:
+            if tag == 5:  # DT_STRTAB (virtual address)
+                for vaddr, foff, fsz in loads:
+                    if vaddr <= val < vaddr + fsz:
+                        strtab = foff + (val - vaddr)
+            if tag in (15, 29):  # DT_RPATH, DT_RUNPATH
+                runpaths.append(val)
+    for val in runpaths:
+        name = "?"
+        if strtab is not None:
+            end = data.index(b"\0", strtab + val)
+            name = data[strtab + val:end].decode()
+        sys.exit(f"{binary}: refuses to install: embedded library path {name}")
+
+GLIBC_CEILING = (2, 39)
+
+def glibc_ok(binary):
+    needed = [tuple(map(int, m.groups())) for m in re.finditer(rb"GLIBC_(\d+)\.(\d+)", open(binary, "rb").read())]
+    if needed and max(needed) > GLIBC_CEILING:
+        sys.exit(f"{binary}: needs glibc {'.'.join(map(str, max(needed)))}, newer than 2.39")
+
+for b in sys.argv[1:]:
+    check(b)
+    glibc_ok(b)
+PY
+}
+
+if [ "${1:-}" = "--check" ]; then
+    verify
+    "$bundle/gpu-powerd" --version
+    echo "bundle verified: system loader, no embedded library paths, glibc <= 2.39"
+    exit 0
+fi
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "Run with sudo: sudo \"$self\" $*" >&2
+    exit 1
+fi
+
+if [ "${1:-}" = "--uninstall" ]; then
+    exec sh "$bundle/install.sh" --uninstall
+fi
+if [ $# -gt 0 ]; then
+    echo "usage: gpu-powerd-setup [--check | --uninstall]" >&2
+    exit 2
+fi
+
+if [ ! -e /proc/driver/nvidia/version ]; then
+    echo "gpu-powerd-setup: no NVIDIA driver on this host (/proc/driver/nvidia/version); nothing installed" >&2
+    exit 1
+fi
+
+verify
+sh "$bundle/install.sh"
+sleep 2
+/usr/local/sbin/gpu-powerd status || true

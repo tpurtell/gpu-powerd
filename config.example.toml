@@ -1,0 +1,54 @@
+# gpu-powerd config: /etc/gpu-powerd/config.toml
+# Apply changes with `systemctl reload gpu-powerd` (SIGHUP) or `gpu-powerd set KEY=VALUE`.
+# A reload that fails validation is rejected and the running config stays in force.
+# Every key is optional; the values shown commented out are the defaults.
+
+# Total power for all GPUs together. Each GPU always gets its base_w; the rest is
+# split by load: an idle GPU stays near base, a busy one gets up to its max_w, and
+# two busy GPUs split by demand (e.g. 900 W -> 600/300 or 450/450).
+# Unset: no shared budget (every GPU may reach its own max_w).
+#system_budget_w = 900
+
+# Thermal limits, on smoothed GPU core temperature.
+# Below throttle_start_c there is no thermal capping; from there the limit ramps
+# linearly down to base_w at hard_c. At or above hard_c (measured or smoothed) a GPU
+# drops straight to base_w.
+#throttle_start_c = 75
+#hard_c = 85
+
+# Limits for every GPU, in watts. Unset: base_w and max_w are the board's own
+# minimum and maximum; fallback_w (the limit left behind on exit, crash or a failed
+# write) is base_w.
+#base_w = 150
+#max_w = 600
+#fallback_w = 150
+
+# Per-GPU overrides, keyed by NVML index ("0"), UUID ("GPU-...") or PCI bus id ("E1:00.0").
+#[gpu."E1:00.0"]
+#max_w = 450
+
+# Control loop (rarely changed).
+#period_s = 1.0               # NVML reads and control once per period
+#step_w = 5                   # limits are written in multiples of this
+#reassert_s = 30              # rewrite an unchanged limit this often
+#smoothing_s = 3              # temperature and power smoothing time constant
+#raise_w_per_s = 10           # a thermal cap rises at most this fast (cuts are immediate)
+#budget_raise_w_per_s = 100   # a budget share grows at most this fast (cuts are immediate)
+#pinned_fraction = 0.95       # draw >= this x limit means power-limited: wants more
+#idle_util_pct = 5            # below this utilization (and not power-limited) a GPU is idle
+#demand_headroom_w = 50       # a busy, unpinned GPU wants its draw plus this
+
+# The learned thermal model (first order, self and cross coupling, fitted online).
+# It can only lower a limit: once confident it keeps the predicted steady-state
+# temperature at or below throttle_start_c - model_margin_c.
+#learn = true
+#use_model = true
+#model_margin_c = 1
+#model_window_s = 5           # seconds of samples per fit row
+#model_forgetting = 0.999     # per window, applied only while the inputs move
+#model_min_samples = 180      # windows (15 min at 5 s) before the model may act
+#model_min_power_std_w = 40   # power variation needed before the model may act
+#model_max_residual_c = 1.5   # the model does not act while its fit error is above this
+
+#state_file = "/run/gpu-powerd/state.json"
+#model_file = "/var/lib/gpu-powerd/model.json"

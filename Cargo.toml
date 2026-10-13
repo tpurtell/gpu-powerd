@@ -1,0 +1,23 @@
+[package]
+name = "gpu-powerd"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0 OR MIT"
+description = "Thermal- and budget-aware NVIDIA power-limit daemon"
+repository = "https://github.com/tpurtell/gpu-powerd"
+rust-version = "1.89"
+
+[dependencies]
+anyhow = "1"
+libc = "0.2"
+libloading = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+signal-hook = "0.3"
+toml = "0.9"
+toml_edit = "0.25"
+
+[profile.release]
+lto = "thin"
+strip = true
+codegen-units = 4

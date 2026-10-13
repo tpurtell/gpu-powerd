@@ -1,0 +1,46 @@
+# gpu-powerd: thermal- and budget-aware NVIDIA power limits. Replaces the boot-time
+# nvidia-power-limit.service (gpu-powerd-setup disables it and records that).
+[Unit]
+Description=GPU power-limit daemon (budget, thermal ramp, learned thermal model)
+Documentation=https://github.com/tpurtell/gpu-powerd
+Wants=nvidia-persistenced.service
+After=nvidia-persistenced.service gpu-fan-curve.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=/usr/local/sbin/gpu-powerd
+ExecReload=/bin/kill -HUP $MAINPID
+# Every stop, crash or watchdog kill leaves each GPU at its fallback_w.
+ExecStopPost=/usr/local/sbin/gpu-powerd --restore
+Restart=always
+RestartSec=5
+WatchdogSec=15
+TimeoutStartSec=90
+TimeoutStopSec=15
+User=root
+RuntimeDirectory=gpu-powerd
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+StateDirectory=gpu-powerd
+StateDirectoryMode=0755
+# NVML needs the NVIDIA device nodes, so no PrivateDevices/DeviceAllow (ProtectClock and
+# similar options imply a device allowlist). Mirrors gpu-fan-curve.service, which writes
+# through NVML under the same restrictions, plus the writable state paths.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/run/lock
+ProtectHome=yes
+PrivateTmp=yes
+ProtectHostname=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+UMask=0022
+
+[Install]
+WantedBy=multi-user.target
