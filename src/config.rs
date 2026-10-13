@@ -110,6 +110,8 @@ pub struct Config {
     pub fan_read_s: f64,
     /// The T.Limit margin is a firmware RPC: read it this often; 0 = never.
     pub tlimit_read_s: f64,
+    /// The per-process VRAM list is cheap but not free: refresh it this often; 0 = never.
+    pub process_read_s: f64,
     /// Limits are written in multiples of this.
     pub step_w: f64,
     /// Rewrite an unchanged limit this often (another tool may have changed it).
@@ -169,6 +171,7 @@ impl Default for Config {
             period_s: 1.0,
             fan_read_s: 10.0,
             tlimit_read_s: 10.0,
+            process_read_s: 10.0,
             step_w: 5.0,
             reassert_s: 30.0,
             smoothing_s: 3.0,
@@ -295,6 +298,9 @@ impl Config {
         in_range("fan_read_s", self.fan_read_s, self.period_s, 3600.0)?;
         if self.tlimit_read_s != 0.0 {
             in_range("tlimit_read_s", self.tlimit_read_s, self.period_s.max(1.0), 3600.0)?;
+        }
+        if self.process_read_s != 0.0 {
+            in_range("process_read_s", self.process_read_s, self.period_s, 3600.0)?;
         }
         in_range("step_w", self.step_w, 1.0, 50.0)?;
         in_range("reassert_s", self.reassert_s, self.period_s, 3600.0)?;
@@ -471,6 +477,8 @@ pub mod tests {
             "[gpu.0]\nmax = 1",
             "period_s = 0.05",
             "fan_read_s = 0.5\nperiod_s = 1",
+            "process_read_s = 0.5\nperiod_s = 1",
+            "process_read_s = -1",
             "websocket_bind = \"everywhere\"",
             "websocket_port = 0",
             "fallback_w = 100\nbase_w = 150",

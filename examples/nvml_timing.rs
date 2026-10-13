@@ -14,7 +14,7 @@ fn main() -> anyhow::Result<()> {
             nvml.read(i).map_err(|e| anyhow::anyhow!("{e}"))?;
         }
         println!(
-            "control-period read {round} (fans cached after the first): {:.3} ms per GPU",
+            "control-period read {round} (fans, process list cached after the first; includes the VRAM read): {:.3} ms per GPU",
             started.elapsed().as_secs_f64() * 1000.0 / n as f64
         );
     }

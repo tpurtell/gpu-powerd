@@ -402,6 +402,7 @@ fn every_key_round_trips_through_toml_and_reload() {
         period_s = 0.5
         fan_read_s = 20
         tlimit_read_s = 0
+        process_read_s = 30
         step_w = 10
         reassert_s = 60
         smoothing_s = 2
@@ -651,7 +652,17 @@ fn state_and_model_files_round_trip() {
     for key in ["limit_w", "plan", "reading", "model", "throttle_reasons", "target_c"] {
         assert!(!state["gpus"][0][key].is_null(), "state has {key}");
     }
-    for key in ["sm_clock_mhz", "mem_clock_mhz", "mem_utilization_pct", "fan_pct", "tlimit_c"] {
+    for key in [
+        "sm_clock_mhz",
+        "mem_clock_mhz",
+        "mem_utilization_pct",
+        "fan_pct",
+        "tlimit_c",
+        "mem_total_mib",
+        "mem_used_mib",
+        "mem_free_mib",
+        "mem_reserved_mib",
+    ] {
         assert!(!state["gpus"][1]["reading"][key].is_null(), "reading has {key}");
     }
     assert!(state["gpus"][1]["model"]["r_self_c_per_w"].is_number());
@@ -691,9 +702,15 @@ fn every_sample_is_published_to_the_stream() {
         "mem_utilization_pct",
         "fan_pct",
         "tlimit_c",
+        "mem_total_mib",
+        "mem_used_mib",
+        "mem_free_mib",
+        "mem_reserved_mib",
     ] {
         assert!(gpu["reading"][key].is_number(), "stream reading has {key}");
     }
+    assert!(gpu["processes"].is_array(), "stream carries the process list");
+    assert_eq!(gpu["processes"][0]["pid"], 4242);
     assert!(gpu["throttle_reasons"].is_array());
     assert!(gpu["plan"]["bound"].is_string() && gpu["plan"]["reason"].is_string());
     assert!(gpu["model"]["confident"].is_boolean());

@@ -85,6 +85,11 @@ No controller can override these bounds:
     595, so periods down to 0.1 s are fine.
   - Fan speed and the T.Limit margin go to the GPU's firmware (1 to 7 ms per call), so
     they are read every `fan_read_s` and `tlimit_read_s` (10 s by default).
+  - VRAM (`nvmlDeviceGetMemoryInfo_v2`: total, used, free, reserved) is read every sample
+    (about 4 µs per GPU; it is not a firmware RPC). The per-process list
+    (`nvmlDeviceGetComputeRunningProcesses_v3`, 0.04 to 0.12 ms per GPU) is cached and
+    refreshed every `process_read_s` (10 s by default, 0 = off). Where NVML reports
+    per-process memory as N/A (WSL), the process entry has no `used_mib`.
   - A limit is written only when its quantised value changes, and rewritten every
     `reassert_s` in case another tool changed it.
 
@@ -240,7 +245,10 @@ as the stream. For each GPU it holds:
 
 - the applied limit, its bound (`max`, `budget`, `pi`, `model`, `correction`,
   `recovering`, `hard`, `sensor`) and a readable reason;
-- the readings and active throttle reasons;
+- the readings (including `mem_total_mib`, `mem_used_mib`, `mem_free_mib` and
+  `mem_reserved_mib`; any unreadable value is null) and active throttle reasons;
+- `processes`: the compute processes (`pid`, `used_mib`) as of the last `process_read_s`
+  refresh, null when off or unreadable;
 - the smoothed values, demand and share;
 - the model summary and its corrected gain.
 

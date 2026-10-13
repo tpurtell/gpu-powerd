@@ -379,8 +379,9 @@ fn check(args: &Args) -> Result<()> {
     print_devices(&devices, &readings);
     println!(
         "NVML cost per GPU: {read_ms:.3} ms per sample, {first_ms:.2} ms with the slow reads \
-         (fan every {} s, T.Limit every {} s)",
-        c.fan_read_s, c.tlimit_read_s
+         (fan every {} s, T.Limit every {} s, process list every {} s); \
+         the VRAM read is part of every sample",
+        c.fan_read_s, c.tlimit_read_s, c.process_read_s
     );
     println!();
     println!(
@@ -453,6 +454,17 @@ fn print_devices(devices: &[DeviceInfo], readings: &[Result<gpu_powerd::backend:
             ),
             Err(e) => println!("  reading failed: {e}"),
         }
+        if let Ok(r) = r {
+            println!("  VRAM {}", vram_text(r.mem_used_mib, r.mem_total_mib));
+        }
+    }
+}
+
+/// `24.1/95.6 GiB`, or `?` when unreadable.
+fn vram_text(used_mib: Option<f64>, total_mib: Option<f64>) -> String {
+    match (used_mib, total_mib) {
+        (Some(u), Some(t)) => format!("{:.1}/{:.1} GiB", u / 1024.0, t / 1024.0),
+        _ => "?".into(),
     }
 }
 
@@ -513,7 +525,7 @@ fn status(args: &Args) -> Result<()> {
     for g in state["gpus"].as_array().into_iter().flatten() {
         let r = &g["reading"];
         println!(
-            "GPU {} [{}]: limit {} W (base {}, max {}), {} C, {} W, {}% util; {}",
+            "GPU {} [{}]: limit {} W (base {}, max {}), {} C, {} W, {}% util, VRAM {}; {}",
             g["index"],
             g["pci"].as_str().unwrap_or("?"),
             f(&g["limit_w"]),
@@ -522,6 +534,7 @@ fn status(args: &Args) -> Result<()> {
             f(&r["temperature_c"]),
             f(&r["power_w"]),
             f(&r["utilization_pct"]),
+            vram_text(r["mem_used_mib"].as_f64(), r["mem_total_mib"].as_f64()),
             g["plan"]["reason"].as_str().unwrap_or("?")
         );
     }

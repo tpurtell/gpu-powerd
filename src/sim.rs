@@ -4,7 +4,7 @@
 //! Plant: `τ_i·dT_i/dt = T_amb + Σ_j R_ij·P_j − T_i`. Each GPU's workload asks for
 //! `demand_w` (0 = idle); it draws `min(demand, limit)`, or `idle_w` when idle.
 //! Readings are quantised like NVML's: whole degrees, milliwatts, whole percent.
-use crate::backend::{Backend, BackendError, DeviceInfo, Reading};
+use crate::backend::{Backend, BackendError, DeviceInfo, ProcessUse, Reading};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -118,6 +118,10 @@ impl Plant {
             fan_pct: Some((30.0 + (g.temp_c - 35.0).max(0.0) * 2.5).min(100.0).round()),
             tlimit_c: Some(90.0 - g.temp_c.round()),
             power_capped: Some(capped),
+            mem_total_mib: Some(97887.0),
+            mem_used_mib: Some(if busy { 24000.0 } else { 600.0 }),
+            mem_free_mib: Some(if busy { 97887.0 - 24000.0 - 500.0 } else { 97887.0 - 600.0 - 500.0 }),
+            mem_reserved_mib: Some(500.0),
         }
     }
 }
@@ -150,6 +154,11 @@ impl Backend for SimBackend {
             });
         }
         Ok(plant.reading(gpu))
+    }
+
+    fn processes(&mut self, gpu: usize) -> Option<Vec<ProcessUse>> {
+        let busy = self.plant.borrow().gpus[gpu].demand_w > 0.0;
+        Some(if busy { vec![ProcessUse { pid: 4242, used_mib: Some(23900.0) }] } else { vec![] })
     }
 
     fn set_limit_w(&mut self, gpu: usize, watts: u32) -> Result<(), BackendError> {

@@ -1,6 +1,6 @@
 //! The daemon: one controller period at a time over any [`Backend`], with limit
 //! writes, learning, model persistence, the state file, and the failsafes.
-use crate::backend::{Backend, DeviceInfo, Reading, throttle_reasons};
+use crate::backend::{Backend, DeviceInfo, ProcessUse, Reading, throttle_reasons};
 use crate::config::{Config, Settings};
 use crate::control::{Bound, Controller, GpuPlan, quantise};
 use crate::model::{FitSettings, ModelSummary, ThermalModel, WindowAccumulator};
@@ -75,6 +75,8 @@ pub struct GpuState {
     pub target_c: f64,
     pub hard_c: f64,
     pub reading: Option<Reading>,
+    /// Compute processes and their VRAM (refreshed every `process_read_s`); `None` when off or unreadable.
+    pub processes: Option<Vec<ProcessUse>>,
     /// Active clock event (throttle) reasons, by name.
     pub throttle_reasons: Vec<&'static str>,
     pub plan: GpuPlan,
@@ -246,6 +248,7 @@ impl<B: Backend> Daemon<B> {
         }
 
         let summaries: Vec<ModelSummary> = self.models.iter().map(|m| m.summary(&fit)).collect();
+        let processes: Vec<Option<Vec<ProcessUse>>> = (0..n).map(|i| self.backend.processes(i)).collect();
         let devices = self.backend.devices();
         let gpus: Vec<GpuState> = (0..n)
             .map(|i| GpuState {
@@ -268,6 +271,7 @@ impl<B: Backend> Daemon<B> {
                     .map(throttle_reasons)
                     .unwrap_or_default(),
                 reading: readings[i].clone().ok(),
+                processes: processes[i].clone(),
                 plan: plans[i].clone(),
                 model: summaries[i].clone(),
                 model_active: plans[i].model_w.is_some(),
@@ -362,7 +366,8 @@ impl<B: Backend> Drop for Daemon<B> {
 fn apply_cadence<B: Backend>(backend: &mut B, c: &Config) {
     let fan = std::time::Duration::from_secs_f64(c.fan_read_s);
     let tlimit = (c.tlimit_read_s > 0.0).then(|| std::time::Duration::from_secs_f64(c.tlimit_read_s));
-    backend.set_slow_cadence(fan, tlimit);
+    let process = (c.process_read_s > 0.0).then(|| std::time::Duration::from_secs_f64(c.process_read_s));
+    backend.set_slow_cadence(fan, tlimit, process);
 }
 
 /// Set every GPU to its fallback limit; returns the failures.

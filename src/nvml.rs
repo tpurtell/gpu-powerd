@@ -5,9 +5,11 @@
 //! limit, SM and memory clocks, clock event reasons; microseconds each on an RTX PRO
 //! 6000 with driver 595). Fan speed is a GSP RPC (about 1-7 ms per fan, measured with
 //! `--example nvml_timing`), and so is the T.Limit margin: both are read at their own
-//! slow cadence (`fan_read_s`, `tlimit_read_s`) and cached between. The cumulative
+//! slow cadence (`fan_read_s`, `tlimit_read_s`) and cached between. VRAM
+//! (`nvmlDeviceGetMemoryInfo_v2`, about 4 us) is read every sample; the per-process list
+//! (`process_read_s`, 0.04-0.12 ms) is cached like the fan speed. The cumulative
 //! throttle counters are never read.
-use crate::backend::{Backend, BackendError, DeviceInfo, Reading};
+use crate::backend::{Backend, BackendError, DeviceInfo, ProcessUse, Reading};
 use anyhow::{Context, Result, bail};
 use libloading::os::unix::{Library, Symbol};
 use std::ffi::CStr;
@@ -52,6 +54,43 @@ struct Utilization {
     memory: c_uint,
 }
 
+/// `nvmlMemory_v2_t`.
+#[repr(C)]
+#[derive(Default)]
+struct MemoryV2 {
+    version: c_uint,
+    total: c_ulonglong,
+    reserved: c_ulonglong,
+    free: c_ulonglong,
+    used: c_ulonglong,
+}
+const MEMORY_V2: c_uint = std::mem::size_of::<MemoryV2>() as c_uint | (2 << 24);
+
+/// `nvmlMemory_t` (v1: no `reserved`).
+#[repr(C)]
+#[derive(Default)]
+struct MemoryV1 {
+    total: c_ulonglong,
+    free: c_ulonglong,
+    used: c_ulonglong,
+}
+
+/// `nvmlProcessInfo_t` (v2/v3 layout used by `nvmlDeviceGetComputeRunningProcesses_v3`).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct ProcessInfo {
+    pid: c_uint,
+    used_gpu_memory: c_ulonglong,
+    gpu_instance_id: c_uint,
+    compute_instance_id: c_uint,
+}
+/// `NVML_VALUE_NOT_AVAILABLE` for `usedGpuMemory`.
+const MEMORY_NOT_AVAILABLE: c_ulonglong = u64::MAX;
+const MIB: f64 = 1024.0 * 1024.0;
+
+type MemoryV2Fn = unsafe extern "C" fn(Device, *mut MemoryV2) -> Ret;
+type MemoryV1Fn = unsafe extern "C" fn(Device, *mut MemoryV1) -> Ret;
+type ProcessesFn = unsafe extern "C" fn(Device, *mut c_uint, *mut ProcessInfo) -> Ret;
 type VoidFn = unsafe extern "C" fn() -> Ret;
 type ErrorStringFn = unsafe extern "C" fn(Ret) -> *const c_char;
 type CountFn = unsafe extern "C" fn(*mut c_uint) -> Ret;
@@ -75,6 +114,8 @@ struct Gpu {
     fan: Option<(std::time::Instant, Option<f64>)>,
     /// The last T.Limit margin and when it was taken.
     tlimit: Option<(std::time::Instant, Option<f64>)>,
+    /// The last process list and when it was taken.
+    processes: Option<(std::time::Instant, Option<Vec<ProcessUse>>)>,
 }
 
 /// An initialised NVML session over every device the driver reports.
@@ -91,8 +132,12 @@ pub struct Nvml {
     fan_speed: Option<FanFn>,
     clock: Option<ClockFn>,
     margin: Option<MarginFn>,
+    memory_v2: Option<MemoryV2Fn>,
+    memory_v1: Option<MemoryV1Fn>,
+    process_list: Option<ProcessesFn>,
     fan_period: std::time::Duration,
     tlimit_period: Option<std::time::Duration>,
+    process_period: Option<std::time::Duration>,
     gpus: Vec<Gpu>,
     info: Vec<DeviceInfo>,
     // Keeps every function pointer above valid; dropped last.
@@ -142,8 +187,12 @@ impl Nvml {
             fan_speed: symbol(&library, "nvmlDeviceGetFanSpeed_v2"),
             clock: symbol(&library, "nvmlDeviceGetClockInfo"),
             margin: symbol(&library, "nvmlDeviceGetMarginTemperature"),
+            memory_v2: symbol(&library, "nvmlDeviceGetMemoryInfo_v2"),
+            memory_v1: symbol(&library, "nvmlDeviceGetMemoryInfo"),
+            process_list: symbol(&library, "nvmlDeviceGetComputeRunningProcesses_v3"),
             fan_period: FAN_PERIOD,
             tlimit_period: Some(FAN_PERIOD),
+            process_period: Some(FAN_PERIOD),
             gpus: Vec::new(),
             info: Vec::new(),
             _library: library,
@@ -194,7 +243,7 @@ impl Nvml {
                     (unsafe { f(handle, &mut value) } == SUCCESS).then_some(value)
                 })
                 .unwrap_or(0);
-            nvml.gpus.push(Gpu { handle, fans, fan: None, tlimit: None });
+            nvml.gpus.push(Gpu { handle, fans, fan: None, tlimit: None, processes: None });
             nvml.info.push(DeviceInfo {
                 index,
                 uuid: c_string(&uuid_buf),
@@ -238,6 +287,67 @@ impl Nvml {
             // SAFETY: a valid out-pointer to a versioned nvmlMarginTemperature_t.
             (unsafe { f(handle, &mut margin) } == SUCCESS).then_some(f64::from(margin.margin))
         })
+    }
+
+    /// VRAM as (total, used, free, reserved) in MiB. `_v2` also reports `reserved`;
+    /// the v1 call is the fallback. `None` when neither works.
+    fn read_memory(&self, handle: Device) -> Option<[Option<f64>; 4]> {
+        if let Some(f) = self.memory_v2 {
+            let mut m = MemoryV2 { version: MEMORY_V2, ..Default::default() };
+            // SAFETY: a valid out-pointer to a versioned nvmlMemory_v2_t.
+            if unsafe { f(handle, &mut m) } == SUCCESS {
+                let mib = |v: c_ulonglong| Some(v as f64 / MIB);
+                return Some([mib(m.total), mib(m.used), mib(m.free), mib(m.reserved)]);
+            }
+        }
+        let f = self.memory_v1?;
+        let mut m = MemoryV1::default();
+        // SAFETY: a valid out-pointer to nvmlMemory_t.
+        if unsafe { f(handle, &mut m) } == SUCCESS {
+            let mib = |v: c_ulonglong| Some(v as f64 / MIB);
+            return Some([mib(m.total), mib(m.used), mib(m.free), None]);
+        }
+        None
+    }
+
+    /// The compute processes on a GPU (count first, then allocate); `None` on failure.
+    fn read_processes(&self, handle: Device) -> Option<Vec<ProcessUse>> {
+        let f = self.process_list?;
+        let mut count: c_uint = 0;
+        // SAFETY: a zero count with a null buffer asks only for the number of entries.
+        let status = unsafe { f(handle, &mut count, std::ptr::null_mut()) };
+        if status == SUCCESS && count == 0 {
+            return Some(Vec::new());
+        }
+        // NVML_ERROR_INSUFFICIENT_SIZE (7) carries the count; a process may appear
+        // between the two calls, so leave room and retry a few times.
+        if status != 7 && status != SUCCESS {
+            return None;
+        }
+        for _ in 0..4 {
+            let mut capacity = count + 8;
+            let mut infos = vec![ProcessInfo::default(); capacity as usize];
+            // SAFETY: `infos` holds `capacity` entries and `capacity` is passed alongside it.
+            let status = unsafe { f(handle, &mut capacity, infos.as_mut_ptr()) };
+            match status {
+                SUCCESS => {
+                    infos.truncate(capacity as usize);
+                    return Some(
+                        infos
+                            .iter()
+                            .map(|p| ProcessUse {
+                                pid: p.pid,
+                                used_mib: (p.used_gpu_memory != MEMORY_NOT_AVAILABLE)
+                                    .then(|| p.used_gpu_memory as f64 / MIB),
+                            })
+                            .collect(),
+                    );
+                }
+                7 => count = capacity,
+                _ => return None,
+            }
+        }
+        None
     }
 
     /// Mean fan speed over every fan, or `None` when any read fails.
@@ -306,6 +416,18 @@ impl Nvml {
                 }),
             ));
         }
+        out.push((
+            "memory info",
+            time(&|| {
+                let _ = self.read_memory(handle);
+            }),
+        ));
+        out.push((
+            "compute processes",
+            time(&|| {
+                let _ = self.read_processes(handle);
+            }),
+        ));
         if let Some(f) = self.fan_speed.filter(|_| fans > 0) {
             out.push((
                 "fan speed (per fan)",
@@ -324,7 +446,7 @@ impl Backend for Nvml {
     }
 
     fn read(&mut self, gpu: usize) -> Result<Reading, BackendError> {
-        let Gpu { handle, fans, fan, tlimit } = self.gpus[gpu];
+        let Gpu { handle, fans, fan, tlimit, .. } = self.gpus[gpu];
         let mut temperature: c_uint = 0;
         // SAFETY: a valid device handle and out-pointer.
         self.check("nvmlDeviceGetTemperature", unsafe {
@@ -368,6 +490,7 @@ impl Backend for Nvml {
                 }
             },
         };
+        let memory = self.read_memory(handle).unwrap_or([None; 4]);
         Ok(Reading {
             temperature_c: f64::from(temperature),
             power_w: f64::from(power_mw) / 1000.0,
@@ -380,12 +503,35 @@ impl Backend for Nvml {
             fan_pct,
             tlimit_c,
             power_capped: throttle_mask.map(|m| m & REASON_SW_POWER_CAP != 0),
+            mem_total_mib: memory[0],
+            mem_used_mib: memory[1],
+            mem_free_mib: memory[2],
+            mem_reserved_mib: memory[3],
         })
     }
 
-    fn set_slow_cadence(&mut self, fan: std::time::Duration, tlimit: Option<std::time::Duration>) {
+    fn set_slow_cadence(
+        &mut self,
+        fan: std::time::Duration,
+        tlimit: Option<std::time::Duration>,
+        process: Option<std::time::Duration>,
+    ) {
         self.fan_period = fan;
         self.tlimit_period = tlimit;
+        self.process_period = process;
+    }
+
+    fn processes(&mut self, gpu: usize) -> Option<Vec<ProcessUse>> {
+        let period = self.process_period?;
+        let Gpu { handle, ref processes, .. } = self.gpus[gpu];
+        if let Some((at, cached)) = processes
+            && at.elapsed() < period
+        {
+            return cached.clone();
+        }
+        let value = self.read_processes(handle);
+        self.gpus[gpu].processes = Some((std::time::Instant::now(), value.clone()));
+        value
     }
 
     fn set_limit_w(&mut self, gpu: usize, watts: u32) -> Result<(), BackendError> {
