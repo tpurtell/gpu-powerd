@@ -1,10 +1,9 @@
-# Draft for tpurtell/local-ai-tap (Formula/gpu-powerd.rb). Fill in url/sha256 from the
-# first GitHub release; the bottle block comes from the tap's bottling workflow.
+# Copy of tpurtell/local-ai-tap's Formula/gpu-powerd.rb (the tap's copy carries the bottle block).
 class GpuPowerd < Formula
   desc "Thermal- and budget-aware NVIDIA power-limit daemon"
   homepage "https://github.com/tpurtell/gpu-powerd"
-  url "https://github.com/tpurtell/gpu-powerd/releases/download/v0.1.0/gpu-powerd-0.1.0.tar.gz"
-  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+  url "https://github.com/tpurtell/gpu-powerd/archive/refs/tags/v0.1.0.tar.gz"
+  sha256 "279542c6d7d862ce90709ec676affce18e195efa926b4133d68f9f05c2fa262e"
   license any_of: ["Apache-2.0", "MIT"]
 
   depends_on "patchelf" => :build
