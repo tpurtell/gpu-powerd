@@ -1,20 +1,38 @@
 //! The control law: pure, with no I/O, driven once per period.
 //!
-//! Per GPU the final limit is `min(budget share, thermal cap, max_w)`, floored at
-//! `base_w`, where the thermal cap is `min(ramp(T_smoothed), model_safe_power)`.
-//! Cuts apply at once; the thermal cap rises at most `raise_w_per_s` and a budget
-//! share at most `budget_raise_w_per_s`. At or above `hard_c` (measured or smoothed)
-//! and on any failed or implausible reading a GPU goes straight to `base_w`.
+//! Each GPU's limit is `min(budget share, thermal limit, max_w)`, floored at `base_w`.
+//! The thermal limit comes from one of two controllers, with safety bounds no
+//! controller can override:
+//!
+//! - **The learned model, once confident** (and `use_model`): the highest power whose
+//!   predicted temperature (steady state, and the trajectory over `model_horizon_s`)
+//!   stays at or below `target_c`, given the other cards' current power and the
+//!   cross-coupling. A cool card is never capped early; a hot one is held just under
+//!   target. A measured-error correction catches a wrong or stale model before
+//!   `hard_c`: an observer scales the model's heating by a gain fitted to the measured
+//!   temperature (so the plan is made with corrected heating), and a proportional cut
+//!   acts while the card is above target. With `model_may_raise = false` the model may only lower
+//!   the PI controller's limit.
+//! - **Before the model is confident: a PI controller** on smoothed temperature with
+//!   setpoint `target_c`. It lowers the limit while above target and releases it while
+//!   below; its integral bleeds away below `throttle_start_c`.
+//!
+//! Below `throttle_start_c` no thermal limit applies at all (the cap goes to `max_w`
+//! at the raise rate). At or above `hard_c` (measured or smoothed) a card drops to
+//! `base_w`; on a failed or implausible reading to `sensor_fail_w`. Cuts apply at once;
+//! the thermal limit rises at most `raise_w_per_s` and a budget share at most
+//! `budget_raise_w_per_s`.
 //!
 //! Budget: every GPU first gets `base_w`; the rest is water-filled (equal levels,
 //! max-min fair) up to each GPU's demand, then any spare up to each GPU's thermal
-//! cap. With `idle_takes_spare` (the default) an idle GPU holds base plus a share of
+//! limit. With `idle_takes_spare` (the default) an idle GPU holds base plus a share of
 //! whatever the busy ones do not want, so it can start work without waiting; the
-//! shares rebalance once it draws. Without it an idle GPU stays at base. Demand comes from load: an idle GPU wants base, a power-limited GPU
-//! (drawing at least `pinned_fraction` of its enforced limit, or reporting a power
-//! cap clock event while busy) wants its thermal cap, and any other busy GPU wants
-//! its draw plus `demand_headroom_w`. Demand never exceeds the thermal cap, so a
-//! GPU capped for heat releases its budget to the others.
+//! shares rebalance once it draws. Without it an idle GPU stays at base. Demand comes
+//! from load: an idle GPU wants base, a power-limited GPU (drawing at least
+//! `pinned_fraction` of its enforced limit, or reporting a power-cap clock event while
+//! busy) wants its thermal limit, and any other busy GPU wants its draw plus
+//! `demand_headroom_w`. Demand never exceeds the thermal limit, so a GPU capped for
+//! heat releases its budget to the others.
 use crate::backend::Reading;
 use crate::config::Settings;
 use crate::model::ThermalModel;
@@ -24,15 +42,17 @@ use serde::Serialize;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Bound {
-    /// A failed or implausible reading: base.
+    /// A failed or implausible reading: sensor_fail_w.
     Sensor,
     /// At or above hard_c: base.
     Hard,
-    /// The temperature ramp.
-    Ramp,
-    /// The thermal model's predicted steady state.
+    /// The PI controller toward target_c (no confident model).
+    Pi,
+    /// The learned model's predicted temperature.
     Model,
-    /// The thermal cap is rising back at the slow rate.
+    /// The model, trimmed by the measured-error correction.
+    Correction,
+    /// The thermal limit is rising back at the slow rate.
     Recovering,
     /// The GPU's share of the system budget.
     Budget,
@@ -40,12 +60,32 @@ pub enum Bound {
     Max,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 struct GpuState {
     temp_smoothed: Option<f64>,
     power_smoothed: f64,
     thermal_cap: Option<f64>,
     share: Option<f64>,
+    /// PI integral (watts of reduction below max_w).
+    pi_integral: f64,
+    /// The observer's heating gain: measured over model-predicted heating.
+    gain: f64,
+    /// The model observer: the temperature the model expects now, given measured powers.
+    predicted_c: Option<f64>,
+}
+
+impl Default for GpuState {
+    fn default() -> Self {
+        Self {
+            temp_smoothed: None,
+            power_smoothed: 0.0,
+            thermal_cap: None,
+            share: None,
+            pi_integral: 0.0,
+            gain: 1.0,
+            predicted_c: None,
+        }
+    }
 }
 
 /// One GPU's decision for this period.
@@ -61,8 +101,16 @@ pub struct GpuPlan {
     pub sensor_error: Option<String>,
     pub temperature_smoothed_c: Option<f64>,
     pub power_smoothed_w: f64,
-    pub ramp_w: f64,
+    /// The PI controller's limit (always computed, so it is ready as a fallback).
+    pub pi_w: f64,
+    /// The model's planned power, when a confident model acts.
     pub model_w: Option<f64>,
+    /// Watts the measured-error correction removes from the model's plan.
+    pub correction_w: f64,
+    /// The temperature the model expects now (its observer), when it acts.
+    pub predicted_c: Option<f64>,
+    /// The observer's heating gain (measured over modelled heating; 1 = the model is right).
+    pub model_gain: f64,
     pub thermal_cap_w: f64,
     pub demand_w: f64,
     pub share_w: f64,
@@ -99,17 +147,6 @@ pub fn plausible(reading: &Reading) -> Result<(), String> {
     Ok(())
 }
 
-/// The ramp: `max_w` at or below `start`, `base_w` at or above `hard`, linear between.
-pub fn ramp(temp_c: f64, start: f64, hard: f64, base_w: f64, max_w: f64) -> f64 {
-    if temp_c <= start {
-        max_w
-    } else if temp_c >= hard {
-        base_w
-    } else {
-        max_w - (max_w - base_w) * (temp_c - start) / (hard - start)
-    }
-}
-
 /// Max-min fair fill: `alloc_i = clamp(L, floor_i, ceil_i)` with the largest level `L`
 /// whose total fits `budget` (or every ceiling, when that fits).
 pub fn water_fill(floors: &[f64], ceilings: &[f64], budget: f64) -> Vec<f64> {
@@ -128,6 +165,11 @@ pub fn water_fill(floors: &[f64], ceilings: &[f64], budget: f64) -> Vec<f64> {
     at(low)
 }
 
+/// The observer's heating gain stays within 1/MAX_GAIN..MAX_GAIN.
+const MAX_GAIN: f64 = 4.0;
+/// The gain adapts against at least this much modelled heating (°C above ambient).
+const MIN_RISE_C: f64 = 5.0;
+
 fn alpha(dt: f64, tau: f64) -> f64 {
     if tau <= 0.0 { 1.0 } else { 1.0 - (-dt / tau).exp() }
 }
@@ -135,12 +177,6 @@ fn alpha(dt: f64, tau: f64) -> f64 {
 impl Controller {
     pub fn new(n: usize) -> Self {
         Self { gpus: vec![GpuState::default(); n] }
-    }
-
-    /// Forget rate history (thermal caps and shares restart from the enforced limits).
-    pub fn reset(&mut self) {
-        let n = self.gpus.len();
-        *self = Self::new(n);
     }
 
     /// One period. `readings[i]` is GPU i's reading or why it failed; `models[i]` is a
@@ -173,44 +209,141 @@ impl Controller {
                         state.power_smoothed + a * (r.power_w - state.power_smoothed)
                     };
                 }
-                // Restart smoothing from the next good reading.
-                Err(_) => state.temp_smoothed = None,
+                // Restart smoothing (and the PI state) from the next good reading.
+                Err(_) => {
+                    state.temp_smoothed = None;
+                    state.predicted_c = None;
+                }
             }
         }
-        let powers: Vec<f64> = self.gpus.iter().map(|g| g.power_smoothed).collect();
-        let target_c = c.throttle_start_c - c.model_margin_c;
+        // Planning uses the other cards' current (instant) draw, which is what they will
+        // heat this card with next.
+        let powers: Vec<f64> = checked
+            .iter()
+            .zip(&self.gpus)
+            .map(|(r, g)| r.as_ref().map(|r| r.power_w).unwrap_or(g.power_smoothed))
+            .collect();
 
-        // Thermal caps.
+        // Thermal limits.
         struct Thermal {
             target: f64,
-            ramp: f64,
+            pi: f64,
             model: Option<f64>,
+            correction: f64,
+            predicted: Option<f64>,
             hard: bool,
+            cool: bool,
         }
         let mut thermal = Vec::with_capacity(n);
         for i in 0..n {
-            let limits = &settings.gpus[i];
-            let (base, max) = (limits.base_w, limits.max_w);
+            let card = &settings.gpus[i];
+            let (base, max) = (card.base_w, card.max_w);
+            let state = &mut self.gpus[i];
             let t = match &checked[i] {
                 Ok(r) => {
-                    let smoothed = self.gpus[i].temp_smoothed.unwrap_or(r.temperature_c);
-                    let ramp_w = ramp(smoothed, c.throttle_start_c, c.hard_c, base, max);
-                    let model_w = models[i].map(|m| m.safe_power_w(target_c, &powers));
-                    let hard = r.temperature_c >= c.hard_c || smoothed >= c.hard_c;
-                    let target =
-                        if hard { base } else { ramp_w.min(model_w.unwrap_or(f64::INFINITY)).min(max).max(base) };
-                    Thermal { target, ramp: ramp_w, model: model_w, hard }
+                    let smoothed = state.temp_smoothed.unwrap_or(r.temperature_c);
+                    // Control on the hotter of measured and smoothed: smoothing must not
+                    // hide a rise.
+                    let temp = smoothed.max(r.temperature_c);
+                    let hard = r.temperature_c >= card.hard_c || smoothed >= card.hard_c;
+                    let cool = temp < card.throttle_start_c;
+
+                    // PI toward target_c: the integral (watts below max) grows while above
+                    // target, shrinks while below, and bleeds away below throttle_start_c.
+                    let error = temp - card.target_c;
+                    if cool {
+                        state.pi_integral *= (-dt / 10.0).exp();
+                    } else {
+                        state.pi_integral += card.pi_ki_w_per_c_s * error * dt;
+                    }
+                    state.pi_integral = state.pi_integral.clamp(0.0, max - base);
+                    let pi = if cool {
+                        max
+                    } else {
+                        (max - state.pi_integral - card.pi_kp_w_per_c * error.max(0.0)).clamp(base, max)
+                    };
+
+                    // The model, with the measured-error correction. An observer runs the
+                    // model forward from the measured powers with the heating (every R
+                    // term) scaled by a gain `g`, and adapts `g` toward what the measured
+                    // temperature implies: a model whose R is off by 2x is corrected by
+                    // g = 2 (or 0.5) within a few time constants, and its plan, made with
+                    // that gain, then holds target_c exactly. The gain adapts at
+                    // `correction_rate_per_s` (fraction of the error per second), four times
+                    // faster when the card runs hotter than predicted (the unsafe
+                    // direction). A proportional term (`correction_kp_w_per_c`) trims the
+                    // plan at once while the card is above target.
+                    let (model, correction, predicted) = match models[i].filter(|_| card.use_model) {
+                        Some(m) => {
+                            let others = &powers;
+                            let gain = state.gain;
+                            let observer = match state.predicted_c {
+                                Some(previous) => m.predict_scaled_c(previous, r.power_w, others, dt, gain),
+                                None => smoothed,
+                            };
+                            let error = smoothed - observer;
+                            // The heating the observer attributes now; the gain moves by the
+                            // error relative to it, so its step size is in °C, not in units of g.
+                            let rise = (observer - m.t_amb_c()).max(MIN_RISE_C);
+                            let rate = card.correction_rate_per_s * if error > 0.0 { 4.0 } else { 1.0 };
+                            let new_gain =
+                                (gain * (1.0 + (rate * dt).min(1.0) * error / rise)).clamp(1.0 / MAX_GAIN, MAX_GAIN);
+                            // Re-anchor the observer to the measurement as the gain absorbs it.
+                            let observer = observer + (rate * dt).min(1.0) * error;
+                            state.gain = new_gain;
+                            state.predicted_c = Some(observer);
+                            let plan =
+                                m.planned_scaled_power_w(card.target_c, temp, others, c.model_horizon_s, new_gain);
+                            let over = smoothed - card.target_c;
+                            let correction = card.correction_kp_w_per_c * over.max(0.0);
+                            (Some(plan), correction, Some(observer))
+                        }
+                        None => {
+                            state.gain = 1.0;
+                            state.predicted_c = None;
+                            (None, 0.0, None)
+                        }
+                    };
+                    let target = if hard {
+                        base
+                    } else if cool && model.is_none() {
+                        // Below throttle_start_c the PI controller applies no limit at all.
+                        // (A confident model may still cap a card it predicts will pass
+                        // target_c: that is the preventive limit.)
+                        max
+                    } else {
+                        match model {
+                            Some(plan) => {
+                                let corrected = plan - correction;
+                                if card.model_may_raise { corrected } else { corrected.min(pi) }
+                            }
+                            None => pi,
+                        }
+                        .clamp(base, max)
+                    };
+                    Thermal { target, pi, model, correction, predicted, hard, cool }
                 }
-                Err(_) => Thermal { target: base, ramp: base, model: None, hard: false },
+                Err(_) => {
+                    state.pi_integral = 0.0;
+                    let fail = card.sensor_fail_w;
+                    Thermal {
+                        target: fail,
+                        pi: fail,
+                        model: None,
+                        correction: 0.0,
+                        predicted: None,
+                        hard: false,
+                        cool: false,
+                    }
+                }
             };
-            let state = &mut self.gpus[i];
             let start = match (&checked[i], state.thermal_cap) {
                 (_, Some(cap)) => cap,
                 (Ok(r), None) => r.limit_w.clamp(base, max),
-                (Err(_), None) => base,
+                (Err(_), None) => card.sensor_fail_w,
             };
             let cap = if t.target <= start { t.target } else { t.target.min(start + c.raise_w_per_s * dt) };
-            state.thermal_cap = Some(cap.clamp(base, max));
+            state.thermal_cap = Some(if checked[i].is_ok() { cap.clamp(base, max) } else { card.sensor_fail_w });
             thermal.push(t);
         }
 
@@ -220,6 +353,10 @@ impl Controller {
         let mut idle = vec![false; n];
         let caps: Vec<f64> = self.gpus.iter().map(|g| g.thermal_cap.unwrap_or(0.0)).collect();
         let bases: Vec<f64> = settings.gpus.iter().map(|g| g.base_w).collect();
+        // A failed card is held at sensor_fail_w: reserve it from the budget.
+        let floors: Vec<f64> = (0..n)
+            .map(|i| if checked[i].is_ok() { bases[i] } else { settings.gpus[i].sensor_fail_w.min(bases[i]) })
+            .collect();
         for i in 0..n {
             let base = bases[i];
             demand[i] = match &checked[i] {
@@ -238,28 +375,55 @@ impl Controller {
                         (draw + c.demand_headroom_w).clamp(base, caps[i])
                     }
                 }
-                Err(_) => base,
+                Err(_) => floors[i],
             };
         }
         let ok: Vec<bool> = checked.iter().map(Result::is_ok).collect();
-        let ceilings_demand: Vec<f64> = (0..n).map(|i| if ok[i] { demand[i] } else { bases[i] }).collect();
-        // Spare budget goes up to each thermal cap; an idle GPU takes a share of it only
+        let ceilings_demand: Vec<f64> = (0..n).map(|i| if ok[i] { demand[i] } else { floors[i] }).collect();
+        // Spare budget goes up to each thermal limit; an idle GPU takes a share of it only
         // with idle_takes_spare (otherwise it stays at its demand, base).
         let ceilings_cap: Vec<f64> = (0..n)
             .map(|i| match ok[i] {
                 true if idle[i] && !c.idle_takes_spare => demand[i],
                 true => caps[i],
-                false => bases[i],
+                false => floors[i],
             })
             .collect();
-        let first = water_fill(&bases, &ceilings_demand, settings.budget_w);
+        let first = water_fill(&floors, &ceilings_demand, settings.budget_w);
         let fill = water_fill(&first, &ceilings_cap, settings.budget_w);
 
         let mut plans = Vec::with_capacity(n);
         for i in 0..n {
-            let limits = &settings.gpus[i];
-            let (base, max) = (limits.base_w, limits.max_w);
+            let card = &settings.gpus[i];
+            let (base, max) = (card.base_w, card.max_w);
             let state = &mut self.gpus[i];
+            let t = &thermal[i];
+            let smoothed = state.temp_smoothed;
+            if let Err(error) = &checked[i] {
+                // Sensor failure: sensor_fail_w regardless of budget or rates.
+                state.share = None;
+                plans.push(GpuPlan {
+                    limit_w: card.sensor_fail_w,
+                    target_w: card.sensor_fail_w,
+                    bound: Bound::Sensor,
+                    reason: format!("sensor failure: {error}"),
+                    sensor_ok: false,
+                    sensor_error: Some(error.clone()),
+                    temperature_smoothed_c: None,
+                    power_smoothed_w: state.power_smoothed,
+                    pi_w: t.pi,
+                    model_w: None,
+                    correction_w: 0.0,
+                    predicted_c: None,
+                    model_gain: 1.0,
+                    thermal_cap_w: card.sensor_fail_w,
+                    demand_w: demand[i],
+                    share_w: card.sensor_fail_w,
+                    pinned: false,
+                    idle: false,
+                });
+                continue;
+            }
             let previous = match (&checked[i], state.share) {
                 (_, Some(share)) => share,
                 (Ok(r), None) => r.limit_w.clamp(base, max),
@@ -269,63 +433,72 @@ impl Controller {
             state.share = Some(share);
             let cap = caps[i];
             let limit = share.min(cap).min(max).max(base);
-            let t = &thermal[i];
             let target = fill[i].min(t.target).min(max).max(base);
-            let smoothed = state.temp_smoothed;
             let near = |a: f64, b: f64| (a - b).abs() < 0.5;
-            let (bound, reason) = match &checked[i] {
-                Err(error) => (Bound::Sensor, format!("sensor failure: {error}")),
-                Ok(r) if t.hard => (
+            let r = checked[i].as_ref().ok();
+            let (bound, reason) = if t.hard {
+                let r = r.map(|r| r.temperature_c).unwrap_or_default();
+                (
                     Bound::Hard,
-                    format!(
-                        "hard: {:.0} C (smoothed {:.1} C) >= {:.0} C",
-                        r.temperature_c,
-                        smoothed.unwrap_or(0.0),
-                        c.hard_c
-                    ),
-                ),
-                Ok(_) if near(limit, max) && share >= max - 0.5 && cap >= max - 0.5 => (Bound::Max, "max".into()),
-                Ok(_) if share < cap - 0.5 && idle[i] => (
-                    Bound::Budget,
-                    format!("idle: base plus spare budget, {:.0} W of {:.0} W", share, settings.budget_w),
-                ),
-                Ok(_) if share < cap - 0.5 => (
+                    format!("hard: {r:.0} C (smoothed {:.1} C) >= {:.0} C", smoothed.unwrap_or(0.0), card.hard_c),
+                )
+            } else if near(limit, max) && share >= max - 0.5 && cap >= max - 0.5 {
+                (Bound::Max, "max".into())
+            } else if share < cap - 0.5 && idle[i] {
+                (Bound::Budget, format!("idle: base plus spare budget, {:.0} W of {:.0} W", share, settings.budget_w))
+            } else if share < cap - 0.5 {
+                (
                     Bound::Budget,
                     format!("budget: share {:.0} W of {:.0} W (demand {:.0} W)", share, settings.budget_w, demand[i]),
-                ),
-                Ok(_) if cap < t.target - 0.5 => {
-                    (Bound::Recovering, format!("recovering: +{:.0} W/s toward {:.0} W", c.raise_w_per_s, t.target))
+                )
+            } else if cap < t.target - 0.5 {
+                (Bound::Recovering, format!("recovering: +{:.0} W/s toward {:.0} W", c.raise_w_per_s, t.target))
+            } else if let Some(plan) = t.model {
+                if t.correction > 0.5 {
+                    (
+                        Bound::Correction,
+                        format!(
+                            "model {:.0} W less {:.0} W measured-error correction ({:.1} C, target {:.0} C)",
+                            plan,
+                            t.correction,
+                            smoothed.unwrap_or(0.0),
+                            card.target_c
+                        ),
+                    )
+                } else {
+                    (
+                        Bound::Model,
+                        format!(
+                            "model: {:.0} W keeps the predicted temperature <= {:.0} C (gain {:.2})",
+                            plan, card.target_c, state.gain
+                        ),
+                    )
                 }
-                Ok(_) if t.model.is_some_and(|m| m < t.ramp) => (
-                    Bound::Model,
+            } else {
+                (
+                    Bound::Pi,
                     format!(
-                        "model: steady state at {:.0} W predicted {:.1} C <= {:.1} C",
-                        t.target,
-                        models[i].map(|m| m.steady_state_c(t.target, &powers)).unwrap_or(f64::NAN),
-                        target_c
-                    ),
-                ),
-                Ok(_) => (
-                    Bound::Ramp,
-                    format!(
-                        "ramp: {:.1} C between {:.0} and {:.0} C",
+                        "pi: {:.1} C toward target {:.0} C{}",
                         smoothed.unwrap_or(0.0),
-                        c.throttle_start_c,
-                        c.hard_c
+                        card.target_c,
+                        if t.cool { " (releasing)" } else { "" }
                     ),
-                ),
+                )
             };
             plans.push(GpuPlan {
                 limit_w: limit,
                 target_w: target,
                 bound,
                 reason,
-                sensor_ok: checked[i].is_ok(),
-                sensor_error: checked[i].as_ref().err().cloned(),
+                sensor_ok: true,
+                sensor_error: None,
                 temperature_smoothed_c: smoothed,
                 power_smoothed_w: state.power_smoothed,
-                ramp_w: t.ramp,
+                pi_w: t.pi,
                 model_w: t.model,
+                correction_w: t.correction,
+                predicted_c: t.predicted,
+                model_gain: state.gain,
                 thermal_cap_w: cap,
                 demand_w: demand[i],
                 share_w: share,
@@ -348,10 +521,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ramp_and_water_fill() {
-        assert_eq!(ramp(70.0, 75.0, 85.0, 150.0, 600.0), 600.0);
-        assert_eq!(ramp(80.0, 75.0, 85.0, 150.0, 600.0), 375.0);
-        assert_eq!(ramp(90.0, 75.0, 85.0, 150.0, 600.0), 150.0);
+    fn water_fill_and_quantise() {
         let near = |a: &[f64], b: &[f64]| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-6);
         assert!(near(&water_fill(&[150.0, 150.0], &[600.0, 600.0], 900.0), &[450.0, 450.0]));
         assert!(near(&water_fill(&[150.0, 150.0], &[600.0, 300.0], 900.0), &[600.0, 300.0]));
@@ -365,14 +535,7 @@ mod tests {
 
     #[test]
     fn rejects_implausible_readings() {
-        let good = Reading {
-            temperature_c: 50.0,
-            power_w: 300.0,
-            utilization_pct: 90.0,
-            limit_w: 600.0,
-            fan_pct: Some(40.0),
-            power_capped: None,
-        };
+        let good = Reading { fan_pct: Some(40.0), ..Reading::basic(50.0, 300.0, 90.0, 600.0) };
         assert!(plausible(&good).is_ok());
         assert!(plausible(&Reading { temperature_c: 0.0, ..good }).is_err());
         assert!(plausible(&Reading { temperature_c: 255.0, ..good }).is_err());

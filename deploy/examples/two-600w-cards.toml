@@ -1,0 +1,30 @@
+# gpu-powerd config for two 600 W cards (e.g. 2x RTX PRO 6000, board range 150..600 W)
+# sharing a 900 W budget. Install as /etc/gpu-powerd/config.toml.
+#
+# One card may reach 600 W while the other is idle; two busy cards split the 900 W by
+# demand. Protection is thermal, per card: the learned model (once confident) or the
+# PI controller holds a hot card at target_c, and hard_c cuts it straight to base_w.
+#
+# Not sensed: memory (GDDR) and VRM temperature are not reported on this board
+# (NVML returns no memory temperature for the RTX PRO 6000), so the controller acts
+# on the GPU core temperature only. Keep throttle_start/target/hard conservative.
+
+system_budget_w = 900
+
+# base_w and max_w unset: the board's own 150 / 600 W (still settable per card in
+# [gpu."SELECTOR"] tables).
+
+throttle_start_c = 75   # no thermal limit below this
+target_c = 80           # held here under sustained load
+hard_c = 85             # at or above: straight to base_w
+
+fallback_w = 325        # known-safe limit left behind on exit, crash or a failed write
+# sensor_fail_w unset: a card whose readings fail drops to its base_w (150 W).
+
+learn = true
+use_model = true
+
+stream = true
+websocket = true        # gpu-powerd-ws: no authentication, LAN only
+websocket_bind = "0.0.0.0"
+websocket_port = 9877

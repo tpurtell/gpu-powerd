@@ -13,21 +13,26 @@ class GpuPowerd < Formula
 
   def install
     # gpu-powerd runs as root, so it must not load anything from this user-writable
-    # prefix. Point it at the system loader with no embedded library paths and pack it:
-    # Homebrew rewrites the loader of every ELF it pours, but leaves a tarball alone.
-    # `gpu-powerd-setup` verifies the bundle and installs it into root-owned /usr/local.
-    # NVML is dlopen()ed at runtime from the driver, so there is no link-time dependency.
+    # prefix. Point both service binaries at the system loader with no embedded library
+    # paths and pack them: Homebrew rewrites the loader of every ELF it pours, but
+    # leaves a tarball alone. `gpu-powerd-setup` verifies the bundle and installs it
+    # into root-owned /usr/local. NVML is dlopen()ed at runtime from the driver, so
+    # there is no link-time dependency.
     root = buildpath/"root"
     system "cargo", "install", *std_cargo_args(root: root)
     bundle = buildpath/"root-bundle"
     bundle.mkpath
     cp root/"bin/gpu-powerd", bundle
+    cp root/"bin/gpu-powerd-ws", bundle
     cp "deploy/install.sh", bundle
     cp "deploy/gpu-powerd.service", bundle
+    cp "deploy/gpu-powerd-ws.service", bundle
     cp "config.example.toml", bundle
     loader = Hardware::CPU.arm? ? "/lib/ld-linux-aarch64.so.1" : "/lib64/ld-linux-x86-64.so.2"
-    system formula_opt_bin("patchelf")/"patchelf", "--set-interpreter", loader, "--remove-rpath",
-           bundle/"gpu-powerd"
+    %w[gpu-powerd gpu-powerd-ws].each do |binary|
+      system formula_opt_bin("patchelf")/"patchelf", "--set-interpreter", loader, "--remove-rpath",
+             bundle/binary
+    end
     (libexec/"gpu-powerd").mkpath
     system "tar", "-C", bundle, "--owner=0", "--group=0", "--numeric-owner",
            "-cf", libexec/"gpu-powerd/root-bundle.tar", "."
@@ -41,13 +46,16 @@ class GpuPowerd < Formula
 
   def caveats
     <<~EOS
-      gpu-powerd sets GPU power limits as root, so a separate step installs it into
-      root-owned /usr/local and starts it (replacing nvidia-power-limit.service if present):
+      gpu-powerd sets GPU power limits as root, so a separate step installs it (and the
+      unprivileged WebSocket relay gpu-powerd-ws) into root-owned /usr/local and starts
+      both (replacing nvidia-power-limit.service if present):
         sudo "#{opt_bin}/gpu-powerd-setup"
       After `brew upgrade gpu-powerd`, run it again. To remove it (and re-enable what it replaced):
         sudo "#{opt_bin}/gpu-powerd-setup" --uninstall
 
       Read-only views, no root needed:  gpu-powerd --check | status | model
+      Live stream: ws://HOST:9877/ (read-only, NO AUTHENTICATION; websocket_bind/_port
+      in the config, websocket = false to turn it off).
       Config: /etc/gpu-powerd/config.toml. Change it with the root-owned copy (never sudo the
       brew one):  sudo /usr/local/sbin/gpu-powerd set KEY=VALUE   (edits and reloads)
     EOS

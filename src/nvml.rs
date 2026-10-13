@@ -2,10 +2,11 @@
 //! on the driver, initialised once, never spawning `nvidia-smi`.
 //!
 //! Per-period reads are the cheap ones (temperature, power, utilization, enforced
-//! limit, clock event reasons; microseconds each on an RTX PRO 6000 with driver 595).
-//! Fan speed is a GSP RPC (about 1-7 ms per fan, measured with `--example
-//! nvml_timing`), so it is read at most every [`FAN_PERIOD`] and cached between. The
-//! throttle counters and T.Limit margin are also GSP RPCs and are not read at all.
+//! limit, SM and memory clocks, clock event reasons; microseconds each on an RTX PRO
+//! 6000 with driver 595). Fan speed is a GSP RPC (about 1-7 ms per fan, measured with
+//! `--example nvml_timing`), and so is the T.Limit margin: both are read at their own
+//! slow cadence (`fan_read_s`, `tlimit_read_s`) and cached between. The cumulative
+//! throttle counters are never read.
 use crate::backend::{Backend, BackendError, DeviceInfo, Reading};
 use anyhow::{Context, Result, bail};
 use libloading::os::unix::{Library, Symbol};
@@ -15,8 +16,18 @@ use std::os::raw::{c_char, c_int, c_uint, c_ulonglong, c_void};
 type Device = *mut c_void;
 type Ret = c_int;
 const SUCCESS: Ret = 0;
-/// Fan speed is an RPC to the GPU's firmware: read it this rarely.
+/// Default cadence for the firmware-RPC readings.
 pub const FAN_PERIOD: std::time::Duration = std::time::Duration::from_secs(10);
+const CLOCK_SM: c_uint = 1;
+const CLOCK_MEM: c_uint = 2;
+
+/// `nvmlMarginTemperature_v1_t`.
+#[repr(C)]
+struct Margin {
+    version: c_uint,
+    margin: c_int,
+}
+const MARGIN_V1: c_uint = std::mem::size_of::<Margin>() as c_uint | (1 << 24);
 const TEMPERATURE_GPU: c_uint = 0;
 /// `nvmlClocksEventReasonSwPowerCap`.
 const REASON_SW_POWER_CAP: c_ulonglong = 0x4;
@@ -54,12 +65,16 @@ type UtilizationFn = unsafe extern "C" fn(Device, *mut Utilization) -> Ret;
 type ReasonsFn = unsafe extern "C" fn(Device, *mut c_ulonglong) -> Ret;
 type FanFn = unsafe extern "C" fn(Device, c_uint, *mut c_uint) -> Ret;
 type SetLimitFn = unsafe extern "C" fn(Device, c_uint) -> Ret;
+type ClockFn = unsafe extern "C" fn(Device, c_uint, *mut c_uint) -> Ret;
+type MarginFn = unsafe extern "C" fn(Device, *mut Margin) -> Ret;
 
 struct Gpu {
     handle: Device,
     fans: u32,
     /// The last fan reading and when it was taken.
     fan: Option<(std::time::Instant, Option<f64>)>,
+    /// The last T.Limit margin and when it was taken.
+    tlimit: Option<(std::time::Instant, Option<f64>)>,
 }
 
 /// An initialised NVML session over every device the driver reports.
@@ -74,6 +89,10 @@ pub struct Nvml {
     set_limit: SetLimitFn,
     reasons: Option<ReasonsFn>,
     fan_speed: Option<FanFn>,
+    clock: Option<ClockFn>,
+    margin: Option<MarginFn>,
+    fan_period: std::time::Duration,
+    tlimit_period: Option<std::time::Duration>,
     gpus: Vec<Gpu>,
     info: Vec<DeviceInfo>,
     // Keeps every function pointer above valid; dropped last.
@@ -121,6 +140,10 @@ impl Nvml {
             reasons: symbol(&library, "nvmlDeviceGetCurrentClocksEventReasons")
                 .or_else(|| symbol(&library, "nvmlDeviceGetCurrentClocksThrottleReasons")),
             fan_speed: symbol(&library, "nvmlDeviceGetFanSpeed_v2"),
+            clock: symbol(&library, "nvmlDeviceGetClockInfo"),
+            margin: symbol(&library, "nvmlDeviceGetMarginTemperature"),
+            fan_period: FAN_PERIOD,
+            tlimit_period: Some(FAN_PERIOD),
             gpus: Vec::new(),
             info: Vec::new(),
             _library: library,
@@ -171,7 +194,7 @@ impl Nvml {
                     (unsafe { f(handle, &mut value) } == SUCCESS).then_some(value)
                 })
                 .unwrap_or(0);
-            nvml.gpus.push(Gpu { handle, fans, fan: None });
+            nvml.gpus.push(Gpu { handle, fans, fan: None, tlimit: None });
             nvml.info.push(DeviceInfo {
                 index,
                 uuid: c_string(&uuid_buf),
@@ -208,6 +231,15 @@ impl Nvml {
 }
 
 impl Nvml {
+    /// The T.Limit margin (°C below the maximum operating temperature).
+    fn read_margin(&self, handle: Device) -> Option<f64> {
+        self.margin.and_then(|f| {
+            let mut margin = Margin { version: MARGIN_V1, margin: 0 };
+            // SAFETY: a valid out-pointer to a versioned nvmlMarginTemperature_t.
+            (unsafe { f(handle, &mut margin) } == SUCCESS).then_some(f64::from(margin.margin))
+        })
+    }
+
     /// Mean fan speed over every fan, or `None` when any read fails.
     fn read_fans(&self, handle: Device, fans: u32) -> Option<f64> {
         self.fan_speed.filter(|_| fans > 0).and_then(|f| {
@@ -292,7 +324,7 @@ impl Backend for Nvml {
     }
 
     fn read(&mut self, gpu: usize) -> Result<Reading, BackendError> {
-        let Gpu { handle, fans, fan } = self.gpus[gpu];
+        let Gpu { handle, fans, fan, tlimit } = self.gpus[gpu];
         let mut temperature: c_uint = 0;
         // SAFETY: a valid device handle and out-pointer.
         self.check("nvmlDeviceGetTemperature", unsafe {
@@ -303,28 +335,57 @@ impl Backend for Nvml {
         let mut utilization = Utilization::default();
         // SAFETY: a valid out-pointer to nvmlUtilization_t.
         self.check("nvmlDeviceGetUtilizationRates", unsafe { (self.utilization)(handle, &mut utilization) })?;
-        let power_capped = self.reasons.and_then(|f| {
+        let throttle_mask = self.reasons.and_then(|f| {
             let mut reasons: c_ulonglong = 0;
             // SAFETY: a valid out-pointer to an unsigned long long.
-            (unsafe { f(handle, &mut reasons) } == SUCCESS).then_some(reasons & REASON_SW_POWER_CAP != 0)
+            (unsafe { f(handle, &mut reasons) } == SUCCESS).then_some(reasons)
         });
-        let fresh = fan.filter(|(at, _)| at.elapsed() < FAN_PERIOD).map(|(_, v)| v);
-        let fan_pct = match fresh {
-            Some(cached) => cached,
+        let clock = |which: c_uint| {
+            self.clock.and_then(|f| {
+                let mut mhz: c_uint = 0;
+                // SAFETY: a valid out-pointer; `which` is an nvmlClockType_t.
+                (unsafe { f(handle, which, &mut mhz) } == SUCCESS).then_some(f64::from(mhz))
+            })
+        };
+        let (sm_clock_mhz, mem_clock_mhz) = (clock(CLOCK_SM), clock(CLOCK_MEM));
+        let now = std::time::Instant::now();
+        let fan_pct = match fan.filter(|(at, _)| at.elapsed() < self.fan_period) {
+            Some((_, cached)) => cached,
             None => {
                 let value = self.read_fans(handle, fans);
-                self.gpus[gpu].fan = Some((std::time::Instant::now(), value));
+                self.gpus[gpu].fan = Some((now, value));
                 value
             }
+        };
+        let tlimit_c = match self.tlimit_period {
+            None => None,
+            Some(period) => match tlimit.filter(|(at, _)| at.elapsed() < period) {
+                Some((_, cached)) => cached,
+                None => {
+                    let value = self.read_margin(handle);
+                    self.gpus[gpu].tlimit = Some((now, value));
+                    value
+                }
+            },
         };
         Ok(Reading {
             temperature_c: f64::from(temperature),
             power_w: f64::from(power_mw) / 1000.0,
             utilization_pct: f64::from(utilization.gpu),
+            mem_utilization_pct: f64::from(utilization.memory),
             limit_w: f64::from(limit_mw) / 1000.0,
+            sm_clock_mhz,
+            mem_clock_mhz,
+            throttle_mask,
             fan_pct,
-            power_capped,
+            tlimit_c,
+            power_capped: throttle_mask.map(|m| m & REASON_SW_POWER_CAP != 0),
         })
+    }
+
+    fn set_slow_cadence(&mut self, fan: std::time::Duration, tlimit: Option<std::time::Duration>) {
+        self.fan_period = fan;
+        self.tlimit_period = tlimit;
     }
 
     fn set_limit_w(&mut self, gpu: usize, watts: u32) -> Result<(), BackendError> {

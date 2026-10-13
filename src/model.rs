@@ -297,6 +297,35 @@ impl ThermalModel {
     pub fn safe_power_w(&self, target_c: f64, others: &[f64]) -> f64 {
         (target_c - self.t_amb_c() - self.cross_c(others)) / self.r_c_per_w(self.gpu)
     }
+
+    /// Predicted temperature after `t_s` seconds from `now_c` at constant powers.
+    pub fn predict_c(&self, now_c: f64, power_w: f64, others: &[f64], t_s: f64) -> f64 {
+        self.predict_scaled_c(now_c, power_w, others, t_s, 1.0)
+    }
+
+    /// As [`predict_c`](Self::predict_c), with the heating (R terms) scaled by `gain`.
+    pub fn predict_scaled_c(&self, now_c: f64, power_w: f64, others: &[f64], t_s: f64, gain: f64) -> f64 {
+        let steady = self.t_amb_c() + gain * (self.steady_state_c(power_w, others) - self.t_amb_c());
+        steady + (now_c - steady) * (-t_s / self.tau_s()).exp()
+    }
+
+    /// The highest power whose predicted temperature stays at or below `target_c` over
+    /// the next `horizon_s`, starting from `now_c`. The trajectory is monotone toward the
+    /// steady state, so it binds at the horizon: `T(H) = S + (now − S)·e^(−H/τ) <= target`.
+    /// Below target this allows a cool card more than its steady-state power (it has
+    /// headroom to spend), and the allowance shrinks as it warms toward target; above
+    /// target the card must be back at target by the horizon.
+    pub fn planned_power_w(&self, target_c: f64, now_c: f64, others: &[f64], horizon_s: f64) -> f64 {
+        self.planned_scaled_power_w(target_c, now_c, others, horizon_s, 1.0)
+    }
+
+    /// As [`planned_power_w`](Self::planned_power_w), with the heating scaled by `gain`.
+    pub fn planned_scaled_power_w(&self, target_c: f64, now_c: f64, others: &[f64], horizon_s: f64, gain: f64) -> f64 {
+        let decay = (-horizon_s / self.tau_s()).exp();
+        let steady_allowed = (target_c - now_c * decay) / (1.0 - decay).max(1e-9);
+        let rise_allowed = (steady_allowed - self.t_amb_c()) / gain;
+        (rise_allowed - self.cross_c(others)) / self.r_c_per_w(self.gpu)
+    }
 }
 
 fn dot(a: &[f64], b: &[f64]) -> f64 {

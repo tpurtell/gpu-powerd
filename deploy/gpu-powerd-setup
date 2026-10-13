@@ -6,8 +6,9 @@
 #   "$(brew --prefix)/bin/gpu-powerd-setup" --check            # verify the bundle, no root needed
 #
 # Why this step exists: gpu-powerd runs as root, so it must not execute from a prefix
-# your user (and therefore your agents) can write. This copies it to /usr/local/sbin,
-# owned by root, after checking that the binary loads nothing from a writable location
+# your user (and therefore your agents) can write. This copies it to /usr/local/sbin
+# (and the unprivileged relay gpu-powerd-ws to /usr/local/bin), owned by root, after
+# checking that neither binary loads anything from a writable location
 # (dynamic loader, RPATH/RUNPATH). NVML is opened at runtime from the driver's own
 # libnvidia-ml.so.1 by the system loader's search path.
 #
@@ -30,14 +31,14 @@ if [ -f "$tarball" ]; then
 else
     bundle=$(dirname "$self")   # a plain bundle directory (deploy/ next to a built binary)
 fi
-for f in gpu-powerd gpu-powerd.service config.example.toml install.sh; do
+for f in gpu-powerd gpu-powerd-ws gpu-powerd.service gpu-powerd-ws.service config.example.toml install.sh; do
     [ -f "$bundle/$f" ] || { echo "gpu-powerd-setup: missing $f in the bundle" >&2; exit 1; }
 done
 
 verify() {
     # Refuse a binary that could load code from a location a non-root user can change,
     # or that needs a newer glibc than the Ubuntu 24.04 baseline.
-    "$python" - "$bundle/gpu-powerd" <<'PY'
+    "$python" - "$bundle/gpu-powerd" "$bundle/gpu-powerd-ws" <<'PY'
 import os, re, stat, struct, sys
 
 def writable_by_others(path):
@@ -107,6 +108,7 @@ PY
 if [ "${1:-}" = "--check" ]; then
     verify
     "$bundle/gpu-powerd" --version
+    "$bundle/gpu-powerd-ws" --version
     echo "bundle verified: system loader, no embedded library paths, glibc <= 2.39"
     exit 0
 fi
@@ -131,5 +133,5 @@ fi
 
 verify
 sh "$bundle/install.sh"
-sleep 2
+sleep 3
 /usr/local/sbin/gpu-powerd status || true

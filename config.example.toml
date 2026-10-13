@@ -1,56 +1,97 @@
 # gpu-powerd config: /etc/gpu-powerd/config.toml
-# Apply changes with `systemctl reload gpu-powerd` (SIGHUP) or `gpu-powerd set KEY=VALUE`.
-# A reload that fails validation is rejected and the running config stays in force.
-# Every key is optional; the values shown commented out are the defaults.
+#
+# Every key is shown with its default, commented out; an empty file is a valid config.
+# Apply changes with `systemctl reload gpu-powerd` (SIGHUP) or
+# `sudo /usr/local/sbin/gpu-powerd set KEY=VALUE`. Every load and reload is validated;
+# a reload that fails validation is rejected and the running config stays in force.
+#
+# Safety rules (checked as ordering invariants on every load):
+#   throttle_start_c < target_c < hard_c
+#   base_w <= fallback_w <= max_w, and every wattage within the board's range
 
-# Total power for all GPUs together. Each GPU always gets its base_w; the rest is
-# split by load: an idle GPU stays near base, a busy one gets up to its max_w, and
-# two busy GPUs split by demand (e.g. 900 W -> 600/300 or 450/450).
+# --- Power budget -------------------------------------------------------------------
+# Total for all GPUs. Each GPU always gets its base_w; the rest is split by load: an
+# idle GPU stays near base, a busy one gets up to its max_w, and two busy GPUs split by
+# demand (900 W -> 450/450, or 600/300 when one wants less).
 # Unset: no shared budget (every GPU may reach its own max_w).
 #system_budget_w = 900
 
-# Thermal limits, on smoothed GPU core temperature.
-# Below throttle_start_c there is no thermal capping; from there the limit ramps
-# linearly down to base_w at hard_c. At or above hard_c (measured or smoothed) a GPU
-# drops straight to base_w.
-#throttle_start_c = 75
-#hard_c = 85
+# --- Per-card keys --------------------------------------------------------------------
+# Set here for every card, or per card in [gpu."SELECTOR"] tables (below).
 
-# Limits for every GPU, in watts. Unset: base_w and max_w are the board's own
-# minimum and maximum; fallback_w (the limit left behind on exit, crash or a failed
-# write) is base_w.
+# Wattages. Unset: base_w and max_w are the board's own minimum and maximum;
+# fallback_w (left behind on exit, crash or a failed write) and sensor_fail_w (while a
+# card's readings fail or are implausible) are base_w.
 #base_w = 150
 #max_w = 600
 #fallback_w = 150
+#sensor_fail_w = 150
 
-# Per-GPU overrides, keyed by NVML index ("0"), UUID ("GPU-...") or PCI bus id ("E1:00.0").
+# Temperatures (GPU core, smoothed). Below throttle_start_c no thermal limit applies at
+# all. Above it the controller holds the card at target_c. At or above hard_c (measured
+# or smoothed) the card drops straight to base_w.
+#throttle_start_c = 75
+#target_c = 80
+#hard_c = 85
+
+# PI controller toward target_c, used until the learned model is confident.
+#pi_kp_w_per_c = 25           # watts per degree above target
+#pi_ki_w_per_c_s = 1          # watts per degree-second (integral; bleeds away below throttle_start_c)
+
+# The learned model leads once confident: it sets the highest power whose predicted
+# temperature stays <= target_c over model_horizon_s. A measured-error correction
+# catches a wrong or stale model: the model's heating is scaled by a gain that adapts
+# to the measured temperature (the residual feeds back into the prediction), and the
+# limit is cut at once while the card is above target.
+#use_model = true
+#model_may_raise = true       # false: the model may only lower the PI controller's limit
+#correction_kp_w_per_c = 25   # watts cut per degree above target_c
+#correction_rate_per_s = 0.05 # gain adaptation rate (x4 when the card runs hotter than predicted)
+
+# Per-card overrides, keyed by NVML index ("0"), UUID ("GPU-...") or PCI bus id
+# ("E1:00.0"). Any per-card key above may appear here.
 #[gpu."E1:00.0"]
 #max_w = 450
+#target_c = 78
 
-# Control loop (rarely changed).
-#period_s = 1.0               # NVML reads and control once per period
-#step_w = 5                   # limits are written in multiples of this
-#reassert_s = 30              # rewrite an unchanged limit this often
-#smoothing_s = 3              # temperature and power smoothing time constant
-#raise_w_per_s = 10           # a thermal cap rises at most this fast (cuts are immediate)
-#budget_raise_w_per_s = 100   # a budget share grows at most this fast (cuts are immediate)
+# --- Load-based budget split ----------------------------------------------------------
 #pinned_fraction = 0.95       # draw >= this x limit means power-limited: wants more
 #idle_util_pct = 5            # below this utilization (and not power-limited) a GPU is idle
 #demand_headroom_w = 50       # a busy, unpinned GPU wants its draw plus this
 #idle_takes_spare = true      # an idle GPU also holds budget the busy ones don't want
                               # (starts work at once; false keeps it at base_w)
 
-# The learned thermal model (first order, self and cross coupling, fitted online).
-# It can only lower a limit: once confident it keeps the predicted steady-state
-# temperature at or below throttle_start_c - model_margin_c.
-#learn = true
-#use_model = true
-#model_margin_c = 1
+# --- Rates, quantisation and sampling -------------------------------------------------
+#period_s = 1.0               # sample + control period; down to 0.1 for a fast stream
+#fan_read_s = 10              # fan speed is a firmware RPC (ms per fan): read this often
+#tlimit_read_s = 10           # T.Limit margin, also a firmware RPC; 0 = never
+#smoothing_s = 3              # temperature and power smoothing time constant
+#raise_w_per_s = 10           # a thermal limit rises at most this fast (cuts are immediate)
+#budget_raise_w_per_s = 100   # a budget share grows at most this fast (cuts are immediate)
+#step_w = 5                   # limits are written in multiples of this
+#reassert_s = 30              # rewrite an unchanged limit this often
+
+# --- Learning -------------------------------------------------------------------------
+#learn = true                 # fit the thermal model online (also while it does not act)
+#model_horizon_s = 120        # a hot card must be predicted back at target within this
 #model_window_s = 5           # seconds of samples per fit row
 #model_forgetting = 0.999     # per window, applied only while the inputs move
 #model_min_samples = 180      # windows (15 min at 5 s) before the model may act
 #model_min_power_std_w = 40   # power variation needed before the model may act
 #model_max_residual_c = 1.5   # the model does not act while its fit error is above this
+#model_save_s = 300           # save the learned model this often (and on exit)
 
+# --- Files ----------------------------------------------------------------------------
 #state_file = "/run/gpu-powerd/state.json"
 #model_file = "/var/lib/gpu-powerd/model.json"
+
+# --- Realtime stream ------------------------------------------------------------------
+# The root daemon publishes every sample on a local Unix socket (never a network
+# socket). gpu-powerd-ws, a separate unprivileged service, relays it to WebSocket
+# clients. The WebSocket is read-only and has NO AUTHENTICATION: anyone who can reach
+# the port sees the samples. Bind it to a trusted network or to 127.0.0.1.
+#stream = true
+#stream_socket = "/run/gpu-powerd/stream.sock"
+#websocket = true
+#websocket_bind = "0.0.0.0"
+#websocket_port = 9877

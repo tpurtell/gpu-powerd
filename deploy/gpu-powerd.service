@@ -1,7 +1,9 @@
 # gpu-powerd: thermal- and budget-aware NVIDIA power limits. Replaces the boot-time
 # nvidia-power-limit.service (gpu-powerd-setup disables it and records that).
+# It opens no network socket: samples go to /run/gpu-powerd/stream.sock, which the
+# unprivileged gpu-powerd-ws.service relays over WebSocket.
 [Unit]
-Description=GPU power-limit daemon (budget, thermal ramp, learned thermal model)
+Description=GPU power-limit daemon (budget, target temperature, learned thermal model)
 Documentation=https://github.com/tpurtell/gpu-powerd
 Wants=nvidia-persistenced.service
 After=nvidia-persistenced.service gpu-fan-curve.service
@@ -35,6 +37,7 @@ ProtectHome=yes
 PrivateTmp=yes
 ProtectHostname=yes
 ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
 RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes

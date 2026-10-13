@@ -98,13 +98,26 @@ impl Plant {
         let g = &self.gpus[i];
         let draw = g.last_draw_w;
         let temp = g.fake_temp_c.unwrap_or(g.temp_c.round());
+        let busy = g.demand_w > 0.0;
+        let capped = busy && draw >= g.limit_w - 0.5;
         Reading {
             temperature_c: temp,
             power_w: (draw * 1000.0).round() / 1000.0,
-            utilization_pct: if g.demand_w > 0.0 { 100.0 } else { 0.0 },
+            utilization_pct: if busy { 100.0 } else { 0.0 },
+            mem_utilization_pct: if busy { 60.0 } else { 0.0 },
             limit_w: g.limit_w,
+            sm_clock_mhz: Some(if busy { 2400.0 } else { 210.0 }),
+            mem_clock_mhz: Some(if busy { 14000.0 } else { 405.0 }),
+            throttle_mask: Some(if capped {
+                0x4
+            } else if busy {
+                0
+            } else {
+                0x1
+            }),
             fan_pct: Some((30.0 + (g.temp_c - 35.0).max(0.0) * 2.5).min(100.0).round()),
-            power_capped: Some(g.demand_w > 0.0 && draw >= g.limit_w - 0.5),
+            tlimit_c: Some(90.0 - g.temp_c.round()),
+            power_capped: Some(capped),
         }
     }
 }

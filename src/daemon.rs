@@ -1,15 +1,12 @@
 //! The daemon: one controller period at a time over any [`Backend`], with limit
 //! writes, learning, model persistence, the state file, and the failsafes.
-use crate::backend::{Backend, DeviceInfo, Reading};
+use crate::backend::{Backend, DeviceInfo, Reading, throttle_reasons};
 use crate::config::{Config, Settings};
 use crate::control::{Bound, Controller, GpuPlan, quantise};
 use crate::model::{FitSettings, ModelSummary, ThermalModel, WindowAccumulator};
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-
-/// How often the learned models are saved while running (and always on exit).
-pub const MODEL_SAVE_S: f64 = 300.0;
 
 /// Persisted models, keyed to the exact GPU set they were fitted on.
 #[derive(Serialize, Deserialize)]
@@ -61,7 +58,7 @@ fn enabled(path: &Path) -> bool {
     !path.as_os_str().is_empty()
 }
 
-/// One GPU's line in the state file.
+/// One GPU's line in the state file and the stream.
 #[derive(Clone, Debug, Serialize)]
 pub struct GpuState {
     pub index: u32,
@@ -73,14 +70,20 @@ pub struct GpuState {
     pub base_w: f64,
     pub max_w: f64,
     pub fallback_w: f64,
+    pub sensor_fail_w: f64,
+    pub throttle_start_c: f64,
+    pub target_c: f64,
+    pub hard_c: f64,
     pub reading: Option<Reading>,
+    /// Active clock event (throttle) reasons, by name.
+    pub throttle_reasons: Vec<&'static str>,
     pub plan: GpuPlan,
     pub model: ModelSummary,
-    /// The model is allowed to lower this GPU's limit now.
+    /// The model is setting this GPU's thermal limit now.
     pub model_active: bool,
 }
 
-/// The state file's contents.
+/// The state file's contents (also each stream message).
 #[derive(Clone, Debug, Serialize)]
 pub struct State {
     pub version: u32,
@@ -88,9 +91,8 @@ pub struct State {
     pub host: String,
     pub pid: u32,
     pub running: bool,
+    pub period_s: f64,
     pub budget_w: f64,
-    pub throttle_start_c: f64,
-    pub hard_c: f64,
     /// Every GPU not at its max, with why; `at max` when none.
     pub reason: String,
     /// The last rejected config reload, if any.
@@ -106,6 +108,9 @@ pub fn hostname() -> String {
     std::fs::read_to_string("/proc/sys/kernel/hostname").map(|h| h.trim().to_string()).unwrap_or_default()
 }
 
+/// A sink for each sample's JSON line.
+pub type Publish = Box<dyn FnMut(&[u8])>;
+
 /// The controller around a backend. Generic so the simulator runs the same code.
 pub struct Daemon<B: Backend> {
     pub backend: B,
@@ -118,14 +123,18 @@ pub struct Daemon<B: Backend> {
     /// Seconds since start (sum of `dt`).
     clock: f64,
     saved_at: f64,
+    state_written_at: f64,
     pub config_error: Option<String>,
     pub last: Option<State>,
+    /// Publishes each sample to `gpu-powerd-ws` (set by the binary; none in tests).
+    pub publish: Option<Publish>,
     /// Set once every GPU has been put at its fallback; Drop does nothing more.
     restored: bool,
 }
 
 impl<B: Backend> Daemon<B> {
-    pub fn new(backend: B, settings: Settings) -> Self {
+    pub fn new(mut backend: B, settings: Settings) -> Self {
+        apply_cadence(&mut backend, &settings.config);
         let n = backend.devices().len();
         let window = settings.config.model_window_s;
         let models = if enabled(&settings.config.model_file) {
@@ -144,8 +153,10 @@ impl<B: Backend> Daemon<B> {
             applied_at: vec![f64::NEG_INFINITY; n],
             clock: 0.0,
             saved_at: 0.0,
+            state_written_at: f64::NEG_INFINITY,
             config_error: None,
             last: None,
+            publish: None,
             restored: false,
         }
     }
@@ -173,6 +184,7 @@ impl<B: Backend> Daemon<B> {
             self.models = (0..n).map(|i| ThermalModel::new(i, n, window)).collect();
             self.windows = vec![WindowAccumulator::default(); n];
         }
+        apply_cadence(&mut self.backend, &settings.config);
         self.settings = settings;
         self.config_error = None;
         // Rewrite every limit on the next period.
@@ -189,7 +201,8 @@ impl<B: Backend> Daemon<B> {
         let fit = fit_settings(&self.settings.config);
         let c = &self.settings.config;
         let summaries: Vec<ModelSummary> = self.models.iter().map(|m| m.summary(&fit)).collect();
-        let active: Vec<bool> = summaries.iter().map(|s| c.use_model && s.confident).collect();
+        let active: Vec<bool> =
+            summaries.iter().zip(&self.settings.gpus).map(|(s, card)| card.use_model && s.confident).collect();
         let usable: Vec<Option<&ThermalModel>> =
             self.models.iter().zip(&active).map(|(m, &a)| a.then_some(m)).collect();
         let plans = self.controller.step(&self.settings, &readings, &usable, dt);
@@ -224,7 +237,7 @@ impl<B: Backend> Daemon<B> {
                     self.models[i].update(w.t_prev, w.t_next, &w.powers, w.fan_pct, &fit);
                 }
             }
-            if self.clock - self.saved_at >= MODEL_SAVE_S {
+            if self.clock - self.saved_at >= c.model_save_s {
                 self.saved_at = self.clock;
                 if let Err(e) = self.save_models() {
                     eprintln!("gpu-powerd: saving the model failed: {e:#}");
@@ -244,10 +257,20 @@ impl<B: Backend> Daemon<B> {
                 base_w: self.settings.gpus[i].base_w,
                 max_w: self.settings.gpus[i].max_w,
                 fallback_w: self.settings.gpus[i].fallback_w,
+                sensor_fail_w: self.settings.gpus[i].sensor_fail_w,
+                throttle_start_c: self.settings.gpus[i].throttle_start_c,
+                target_c: self.settings.gpus[i].target_c,
+                hard_c: self.settings.gpus[i].hard_c,
+                throttle_reasons: readings[i]
+                    .as_ref()
+                    .ok()
+                    .and_then(|r| r.throttle_mask)
+                    .map(throttle_reasons)
+                    .unwrap_or_default(),
                 reading: readings[i].clone().ok(),
                 plan: plans[i].clone(),
                 model: summaries[i].clone(),
-                model_active: active[i],
+                model_active: plans[i].model_w.is_some(),
             })
             .collect();
         let reason = gpus
@@ -262,17 +285,24 @@ impl<B: Backend> Daemon<B> {
             host: hostname(),
             pid: std::process::id(),
             running: true,
+            period_s: c.period_s,
             budget_w: self.settings.budget_w,
-            throttle_start_c: c.throttle_start_c,
-            hard_c: c.hard_c,
             reason: if reason.is_empty() { "at max".into() } else { reason },
             config_error: self.config_error.clone(),
             gpus,
         };
-        if enabled(&c.state_file)
-            && let Err(e) = write_atomic(&c.state_file, &serde_json::to_vec_pretty(&state)?)
-        {
-            eprintln!("gpu-powerd: writing the state file failed: {e:#}");
+        // The state file at most once a second (it is for status tools); the stream on
+        // every sample.
+        if enabled(&c.state_file) && self.clock - self.state_written_at >= 1.0 - 1e-9 {
+            self.state_written_at = self.clock;
+            if let Err(e) = write_atomic(&c.state_file, &serde_json::to_vec_pretty(&state)?) {
+                eprintln!("gpu-powerd: writing the state file failed: {e:#}");
+            }
+        }
+        if let Some(publish) = self.publish.as_mut() {
+            let mut line = serde_json::to_vec(&state)?;
+            line.push(b'\n');
+            publish(&line);
         }
         Ok(self.last.insert(state))
     }
@@ -327,6 +357,12 @@ impl<B: Backend> Drop for Daemon<B> {
             }
         }
     }
+}
+
+fn apply_cadence<B: Backend>(backend: &mut B, c: &Config) {
+    let fan = std::time::Duration::from_secs_f64(c.fan_read_s);
+    let tlimit = (c.tlimit_read_s > 0.0).then(|| std::time::Duration::from_secs_f64(c.tlimit_read_s));
+    backend.set_slow_cadence(fan, tlimit);
 }
 
 /// Set every GPU to its fallback limit; returns the failures.

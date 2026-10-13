@@ -201,7 +201,19 @@ fn run(args: &Args) -> Result<()> {
     let config = load_config(&args.config)?;
     let settings = config.resolve(nvml.devices())?;
     describe(nvml.devices(), &settings);
+    let stream_socket = settings.config.stream.then(|| settings.config.stream_socket.clone());
     let mut daemon = Daemon::new(nvml, settings);
+    // The sample stream for gpu-powerd-ws: a local Unix socket, never a network socket.
+    // It is optional: failing to open it is logged, not fatal.
+    if let Some(path) = stream_socket {
+        match gpu_powerd::stream::Publisher::bind(&path) {
+            Ok(mut publisher) => {
+                eprintln!("gpu-powerd: publishing samples on {}", path.display());
+                daemon.publish = Some(Box::new(move |line: &[u8]| publisher.publish(line)));
+            }
+            Err(e) => eprintln!("gpu-powerd: cannot open the stream socket {}: {e}", path.display()),
+        }
+    }
     let period = Duration::from_secs_f64(daemon.settings.config.period_s);
     let mut last = Instant::now();
     let mut ready = false;
@@ -256,22 +268,33 @@ fn run(args: &Args) -> Result<()> {
 fn describe(devices: &[DeviceInfo], settings: &Settings) {
     let c = &settings.config;
     eprintln!(
-        "gpu-powerd: budget {:.0} W, throttle_start {:.0} C, hard {:.0} C, model {}",
+        "gpu-powerd: budget {:.0} W, period {} s, learning {}, stream {}",
         settings.budget_w,
-        c.throttle_start_c,
-        c.hard_c,
-        if !c.learn {
-            "off"
-        } else if c.use_model {
-            "learning, acts when confident"
-        } else {
-            "learning only"
-        }
+        c.period_s,
+        if c.learn { "on" } else { "off" },
+        if c.stream { c.stream_socket.display().to_string() } else { "off".into() }
     );
     for (d, g) in devices.iter().zip(&settings.gpus) {
         eprintln!(
-            "gpu-powerd: GPU {} {} ({}) base {:.0} W, max {:.0} W, fallback {:.0} W (board {:.0}..{:.0} W)",
-            d.index, d.uuid, d.pci, g.base_w, g.max_w, g.fallback_w, d.board_min_w, d.board_max_w
+            "gpu-powerd: GPU {} {} ({}) base {:.0} W, max {:.0} W, fallback {:.0} W, sensor-fail {:.0} W \
+             (board {:.0}..{:.0} W); throttle_start {:.0} C, target {:.0} C, hard {:.0} C; model {}",
+            d.index,
+            d.uuid,
+            d.pci,
+            g.base_w,
+            g.max_w,
+            g.fallback_w,
+            g.sensor_fail_w,
+            d.board_min_w,
+            d.board_max_w,
+            g.throttle_start_c,
+            g.target_c,
+            g.hard_c,
+            match (g.use_model, g.model_may_raise) {
+                (false, _) => "off",
+                (true, true) => "leads when confident",
+                (true, false) => "lowers only",
+            }
         );
     }
 }
@@ -324,8 +347,9 @@ fn check(args: &Args) -> Result<()> {
     let fit = fit_settings(c);
     let models = load_models(&c.model_file, &devices, c.model_window_s);
     let summaries: Vec<_> = models.as_ref().map(|m| m.iter().map(|m| m.summary(&fit)).collect()).unwrap_or_default();
-    let usable: Vec<Option<&ThermalModel>> =
-        (0..n).map(|i| models.as_ref().filter(|_| c.use_model && summaries[i].confident).map(|m| &m[i])).collect();
+    let usable: Vec<Option<&ThermalModel>> = (0..n)
+        .map(|i| models.as_ref().filter(|_| settings.gpus[i].use_model && summaries[i].confident).map(|m| &m[i]))
+        .collect();
     // An unbounded step: no rate limits or smoothing history, so the plan is where the
     // limits settle for these readings rather than the first step from the current ones.
     let plans = Controller::new(n).step(&settings, &readings, &usable, 1e9);
@@ -354,16 +378,16 @@ fn check(args: &Args) -> Result<()> {
     }
     print_devices(&devices, &readings);
     println!(
-        "NVML cost per GPU: {read_ms:.3} ms per control period, {first_ms:.2} ms with the fan read (every {} s)",
-        gpu_powerd::nvml::FAN_PERIOD.as_secs()
+        "NVML cost per GPU: {read_ms:.3} ms per sample, {first_ms:.2} ms with the slow reads \
+         (fan every {} s, T.Limit every {} s)",
+        c.fan_read_s, c.tlimit_read_s
     );
     println!();
     println!(
-        "Config {}: budget {:.0} W, throttle_start {:.0} C, hard {:.0} C, fallback on exit as below.",
+        "Config {}: budget {:.0} W, period {} s.",
         if args.config.exists() { args.config.display().to_string() } else { "(defaults)".into() },
         settings.budget_w,
-        c.throttle_start_c,
-        c.hard_c
+        c.period_s
     );
     println!("Plan (read-only; nothing is written):");
     for i in 0..n {
@@ -371,15 +395,19 @@ fn check(args: &Args) -> Result<()> {
         let p = &plans[i];
         let target = quantise(p.target_w, c.step_w, g.base_w, g.max_w);
         println!(
-            "  GPU {}: base {:.0} W, max {:.0} W, fallback {:.0} W -> {} W ({}) [demand {:.0} W, ramp {:.0} W{}]",
+            "  GPU {}: {:.0}/{:.0}/{:.0} C, base {:.0} W, max {:.0} W, fallback {:.0} W -> {} W ({}) \
+             [demand {:.0} W, pi {:.0} W{}]",
             devices[i].index,
+            g.throttle_start_c,
+            g.target_c,
+            g.hard_c,
             g.base_w,
             g.max_w,
             g.fallback_w,
             target,
             p.reason,
             p.demand_w,
-            p.ramp_w,
+            p.pi_w,
             p.model_w.map(|m| format!(", model {m:.0} W")).unwrap_or_default()
         );
     }
@@ -390,7 +418,7 @@ fn check(args: &Args) -> Result<()> {
                 println!("  GPU {i}: {}", model_line(s));
             }
         }
-        None => println!("Model: none saved yet at {} (the ramp alone governs)", c.model_file.display()),
+        None => println!("Model: none saved yet at {} (the PI controller governs)", c.model_file.display()),
     }
     Ok(())
 }
@@ -406,15 +434,21 @@ fn print_devices(devices: &[DeviceInfo], readings: &[Result<gpu_powerd::backend:
         );
         match r {
             Ok(r) => println!(
-                "  {:.0} C, {:.1} W of {:.0} W limit, {:.0}% util{}{}",
+                "  {:.0} C{}, {:.1} W of {:.0} W limit, {:.0}% util ({:.0}% mem){}{}{}",
                 r.temperature_c,
+                r.tlimit_c.map(|m| format!(" (T.Limit margin {m:.0} C)")).unwrap_or_default(),
                 r.power_w,
                 r.limit_w,
                 r.utilization_pct,
+                r.mem_utilization_pct,
+                match (r.sm_clock_mhz, r.mem_clock_mhz) {
+                    (Some(sm), Some(mem)) => format!(", SM {sm:.0} / mem {mem:.0} MHz"),
+                    _ => String::new(),
+                },
                 r.fan_pct.map(|f| format!(", fan {f:.0}%")).unwrap_or_default(),
-                match r.power_capped {
-                    Some(true) => ", power-capped",
-                    _ => "",
+                match r.throttle_mask.map(gpu_powerd::backend::throttle_reasons) {
+                    Some(reasons) if !reasons.is_empty() => format!(", clocks: {}", reasons.join(" ")),
+                    _ => String::new(),
                 }
             ),
             Err(e) => println!("  reading failed: {e}"),
@@ -472,12 +506,7 @@ fn status(args: &Args) -> Result<()> {
         if state["running"].as_bool() == Some(true) { "running" } else { "stopped" },
         age
     );
-    println!(
-        "budget {} W, throttle_start {} C, hard {} C",
-        f(&state["budget_w"]),
-        f(&state["throttle_start_c"]),
-        f(&state["hard_c"])
-    );
+    println!("budget {} W, period {} s", f(&state["budget_w"]), state["period_s"]);
     if let Some(e) = state["config_error"].as_str() {
         println!("last reload rejected: {e}");
     }
