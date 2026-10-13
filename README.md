@@ -88,7 +88,7 @@ No controller can override these bounds:
   - VRAM (`nvmlDeviceGetMemoryInfo_v2`: total, used, free, reserved) is read every sample
     (about 4 µs per GPU; it is not a firmware RPC). The per-process list
     (`nvmlDeviceGetComputeRunningProcesses_v3`, 0.04 to 0.12 ms per GPU) is cached and
-    refreshed every `process_read_s` (10 s by default, 0 = off). Where NVML reports
+    off by default; set `process_read_s` (seconds) to refresh it. Where NVML reports
     per-process memory as N/A (WSL), the process entry has no `used_mib`.
   - A limit is written only when its quantised value changes, and rewritten every
     `reassert_s` in case another tool changed it.

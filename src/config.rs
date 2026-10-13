@@ -171,7 +171,7 @@ impl Default for Config {
             period_s: 1.0,
             fan_read_s: 10.0,
             tlimit_read_s: 10.0,
-            process_read_s: 10.0,
+            process_read_s: 0.0,
             step_w: 5.0,
             reassert_s: 30.0,
             smoothing_s: 3.0,

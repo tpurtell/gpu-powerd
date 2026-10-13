@@ -65,7 +65,7 @@
 #period_s = 1.0               # sample + control period; down to 0.1 for a fast stream
 #fan_read_s = 10              # fan speed is a firmware RPC (ms per fan): read this often
 #tlimit_read_s = 10           # T.Limit margin, also a firmware RPC; 0 = never
-#process_read_s = 10          # per-process VRAM list (pid, MiB; ~0.1 ms/GPU): refresh this often; 0 = off
+#process_read_s = 0           # per-process VRAM list (pid, MiB; ~0.1 ms/GPU), refreshed this often; 0 = off (default)
                               # (total/used/free VRAM is read every sample regardless)
 #smoothing_s = 3              # temperature and power smoothing time constant
 #raise_w_per_s = 10           # a thermal limit rises at most this fast (cuts are immediate)
